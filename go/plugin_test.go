@@ -617,6 +617,45 @@ func TestAModelThePlanRefusesIsHiddenAndNotRetried(t *testing.T) {
 	}
 }
 
+func TestACanceledRequestIsTheCallersNotTheCredentials(t *testing.T) {
+	resetPluginState()
+	cases := []struct {
+		cause    string
+		status   int
+		code     string
+		contains string
+	}{
+		{"context canceled", 499, "client_closed", "caller closed the request"},
+		{"Post \"https://copilot.tencent.com/v2/chat/completions\": context deadline exceeded", http.StatusGatewayTimeout, "upstream_timeout", "time limit"},
+		{"write tcp 10.0.0.1:1234->1.2.3.4:443: write: broken pipe", 499, "client_closed", "caller closed"},
+		{"upstream connect error", 503, "transport_error", "transport failed"},
+	}
+	for _, tc := range cases {
+		sender := &fakeSender{reply: func(pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error) {
+			return pluginapi.HTTPResponse{}, &transportError{cause: tc.cause}
+		}}
+		// The model list has to answer, or the request would stop before the chat.
+		listing := &fakeSender{reply: func(req pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error) {
+			if strings.HasSuffix(req.URL, "/v3/config") {
+				return jsonReply(200, `{"code":0,"data":{"agents":[{"name":"cli","models":["glm-5.3"]}],"models":[{"id":"glm-5.3"}]}}`), nil
+			}
+			return sender.reply(req)
+		}}
+		body, _ := json.Marshal(map[string]any{"model": "glm-5.3", "messages": []map[string]any{{"role": "user", "content": "hi"}}})
+		_, err := execute(pluginapi.ExecutorRequest{Model: "glm-5.3", Payload: body, StorageJSON: testCredential(siteWorkBuddy)}, listing)
+		var perr *pluginabi.Error
+		if !errors.As(err, &perr) {
+			t.Fatalf("%q: err = %#v", tc.cause, err)
+		}
+		if perr.HTTPStatus != tc.status || perr.Code != tc.code {
+			t.Fatalf("%q: %d %s", tc.cause, perr.HTTPStatus, perr.Code)
+		}
+		if !strings.Contains(perr.Message, tc.contains) {
+			t.Fatalf("%q: message %q", tc.cause, perr.Message)
+		}
+	}
+}
+
 func TestCountTokensIsNotInvented(t *testing.T) {
 	_, err := countTokens()
 	var perr *pluginabi.Error

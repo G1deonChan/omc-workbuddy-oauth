@@ -18,13 +18,43 @@ type httpSender interface {
 
 type cpaSender struct{ callbackID string }
 
+// transportError keeps what the host said about a request that never got an
+// answer. The cause is the difference between a caller that went away, a host
+// timeout and a broken connection, and each of those deserves its own status.
+type transportError struct{ cause string }
+
+func (e *transportError) Error() string { return e.cause }
+
 func (s cpaSender) Do(req pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error) {
 	var out pluginapi.HTTPResponse
 	err := hostRPC("host.http.do", map[string]any{"host_callback_id": s.callbackID, "request": req}, &out)
 	if err != nil {
-		return out, fmt.Errorf("upstream transport failed")
+		return out, &transportError{cause: err.Error()}
 	}
 	return out, nil
+}
+
+// transportFailure maps a request that got no answer onto the status a client
+// should see. A cancellation is the caller's own, not the credential's: CPA reads
+// 499 as "the client closed the request" and does not rest the account for it.
+func transportFailure(err error) error {
+	text := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(text, "context canceled"),
+		strings.Contains(text, "client closed"),
+		strings.Contains(text, "client disconnected"),
+		strings.Contains(text, "broken pipe"),
+		strings.Contains(text, "connection reset"):
+		return pluginabi.NewError("client_closed",
+			"the caller closed the request before WorkBuddy answered; a thinking model can take longer than a caller's timeout, so stream it instead",
+			499)
+	case strings.Contains(text, "deadline exceeded"),
+		strings.Contains(text, "timeout"),
+		strings.Contains(text, "timed out"):
+		return pluginabi.NewError("upstream_timeout", "WorkBuddy did not answer within the host's time limit", http.StatusGatewayTimeout)
+	default:
+		return pluginabi.NewError("transport_error", "WorkBuddy upstream transport failed", 503)
+	}
 }
 
 // wbError is a refusal WorkBuddy answered with: its HTTP status, the code in its

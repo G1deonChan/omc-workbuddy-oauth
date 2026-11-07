@@ -113,7 +113,7 @@ func execute(req pluginapi.ExecutorRequest, sender httpSender) (pluginapi.Execut
 	defer release()
 	resp, err := sender.Do(plan.HTTP)
 	if err != nil {
-		return pluginapi.ExecutorResponse{}, pluginabi.NewError("transport_error", "WorkBuddy upstream transport failed", 503)
+		return pluginapi.ExecutorResponse{}, transportFailure(err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return pluginapi.ExecutorResponse{}, classifyUpstream(plan.Credential, resp.StatusCode, resp.Body)
@@ -155,10 +155,10 @@ type hostReadResponse struct {
 func readHostStream(id string) (hostReadResponse, error) {
 	var r hostReadResponse
 	if err := hostRPC("host.http.stream_read", map[string]any{"stream_id": id}, &r); err != nil {
-		return r, errors.New("upstream stream read failed")
+		return r, &transportError{cause: err.Error()}
 	}
 	if r.Error != "" {
-		return r, errors.New("upstream stream failed")
+		return r, &transportError{cause: r.Error}
 	}
 	return r, nil
 }
@@ -242,7 +242,7 @@ func (p *streamPump) run() {
 	for {
 		r, err := readStreamChunk(p.source)
 		if err != nil {
-			closeStream(p.target, "WorkBuddy stream failed")
+			closeStream(p.target, streamFailureMessage(err))
 			return
 		}
 		if !p.deliver(p.buffer.push(r.Payload)) {
@@ -275,7 +275,7 @@ func executeStream(req pluginapi.ExecutorRequest, callbackID, streamID string, s
 	response, err := openHTTPStream(plan, callbackID)
 	if err != nil {
 		release()
-		return nil, pluginabi.NewError("transport_error", "WorkBuddy upstream stream failed", 503)
+		return nil, transportFailure(err)
 	}
 	if response.StreamID == "" {
 		release()
@@ -300,7 +300,7 @@ func executeStream(req pluginapi.ExecutorRequest, callbackID, streamID string, s
 		if err != nil {
 			closeHostStream(response.StreamID)
 			release()
-			return nil, pluginabi.NewError("transport_error", "WorkBuddy upstream stream failed", 503)
+			return nil, transportFailure(err)
 		}
 		frames := buffer.push(r.Payload)
 		for _, frame := range frames {
@@ -334,6 +334,15 @@ func executeStream(req pluginapi.ExecutorRequest, callbackID, streamID string, s
 		pump.run()
 	}()
 	return map[string]any{"headers": http.Header{"Content-Type": {"text/event-stream"}}}, nil
+}
+
+// streamFailureMessage says why a stream stopped, for the client's error frame.
+func streamFailureMessage(err error) string {
+	var e *pluginabi.Error
+	if errors.As(transportFailure(err), &e) && e.HTTPStatus == 499 {
+		return "the caller closed the request"
+	}
+	return "WorkBuddy stream failed"
 }
 
 // countTokens is not supported: WorkBuddy documents no token-count endpoint, and
