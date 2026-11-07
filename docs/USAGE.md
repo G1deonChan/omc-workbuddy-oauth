@@ -363,9 +363,15 @@ sees the mapped status:
 | Any other `4xx` | The upstream status with WorkBuddy's message and code |
 | `5xx` | `502` |
 | Transport failure, or an unavailable upstream stream | `503` |
+| The caller closed the request before WorkBuddy answered (`context canceled`) | `499`, code `client_closed` |
+| WorkBuddy did not answer within the host's limit (`deadline exceeded`) | `504`, code `upstream_timeout` |
 
 Other behaviour worth knowing:
 
+- A request that never got an answer is reported for what it was: `499` when the
+  caller went away, `504` when the host's time limit ran out, `503` otherwise. CPA
+  reads `499` as the client's own cancellation and does not rest the credential for
+  it, so a caller's short timeout never turns into a credential warning.
 - The plugin does not retry a refusal in place. It answers with the mapped status so
   CPA can decide whether another credential should carry the request.
 - A refusal that arrives inside an `OK` stream keeps its real status: streaming
@@ -403,6 +409,16 @@ Other behaviour worth knowing:
   system prompt carries a line the plugin does not know how to reword yet. Report it
   with the offending line, and use a client whose opening the plugin already knows in
   the meantime.
+- **`499` with `context canceled`:** the caller stopped waiting, not WorkBuddy. The
+  plugin reports it as `499` / `client_closed`, and CPA does not count it against the
+  credential. A **non-streaming** request is the usual cause: WorkBuddy only streams,
+  so the plugin has to hold the whole answer — thinking included — before it can
+  return one completion, and a caller with a 30–60s timeout gives up first. Ask for a
+  stream, or give the caller a longer timeout. `deepseek-v4.1-flash-sg` amplifies it:
+  it is reasoning-only with `defaultEffort` `high`, so a prompt it thinks hard about
+  takes that much longer to its first token.
+- **`504` with `upstream_timeout`:** the host's own limit ran out before WorkBuddy
+  answered; raise CPA's timeout for the route, or stream it.
 - **`403` on a model that is listed:** the account is not entitled to that model
   (WorkBuddy code `11158`), or its plan does not include it.
 - **The credential shows a warning like `model [gpt-6.1-sol] is not allowed for
