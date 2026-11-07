@@ -155,7 +155,7 @@ func TestParseAuthRejectsForeignFiles(t *testing.T) {
 }
 
 func TestManagementServesPublishedBytes(t *testing.T) {
-	for _, name := range []string{"workbuddy.svg", "codebuddy-color.svg"} {
+	for name, contentType := range map[string]string{"logo.png": "image/png", "workbuddy.svg": "image/svg+xml", "codebuddy-color.svg": "image/svg+xml"} {
 		want, err := os.ReadFile("../assets/" + name)
 		if err != nil {
 			t.Fatal(err)
@@ -171,7 +171,7 @@ func TestManagementServesPublishedBytes(t *testing.T) {
 		if got.StatusCode != http.StatusOK || !bytes.Equal(got.Body, want) {
 			t.Fatalf("%s: status %d, %d bytes", name, got.StatusCode, len(got.Body))
 		}
-		if got.Headers.Get("Content-Type") != "image/svg+xml" || got.Headers.Get("X-Content-Type-Options") != "nosniff" {
+		if got.Headers.Get("Content-Type") != contentType || got.Headers.Get("X-Content-Type-Options") != "nosniff" {
 			t.Fatalf("%s headers = %v", name, got.Headers)
 		}
 	}
@@ -201,9 +201,9 @@ func TestManagementRejectsWritesAndUnknownPaths(t *testing.T) {
 }
 
 func TestEmbeddedAssetsMatchPublishedOnes(t *testing.T) {
-	// The declaration is authored where the plugin embeds it; the two marks are
+	// The declaration is authored where the plugin embeds it; the three marks are
 	// published from assets/ and embedded from go/assets/.
-	for _, name := range []string{"workbuddy.svg", "codebuddy-color.svg"} {
+	for _, name := range []string{"logo.png", "workbuddy.svg", "codebuddy-color.svg"} {
 		published, err := os.ReadFile("../assets/" + name)
 		if err != nil {
 			t.Fatal(err)

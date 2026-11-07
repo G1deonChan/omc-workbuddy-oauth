@@ -145,7 +145,7 @@ GET /v8/management/oauth/auth-url?provider=workbuddy-ai
 The caller must supply the management key in the `Authorization: Bearer ...`
 header. Do not put the key in a URL. Use the URL returned by CPA to complete the
 sign-in in the browser. A request without that header cannot initiate a flow.
-Public plugin resources serve only the static `workbuddy.svg`,
+Public plugin resources serve only the static `logo.png`, `workbuddy.svg`,
 `codebuddy-color.svg` and `omc.json` assets; other paths answer 404 and a non-GET
 request answers 405.
 

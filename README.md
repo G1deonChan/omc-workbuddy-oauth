@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/workbuddy.svg" width="96" height="96" alt="OMC WorkBuddy OAuth logo">
+  <img src="assets/logo.png" width="96" height="96" alt="OMC WorkBuddy OAuth logo">
 </p>
 
 <h1 align="center">OMC WorkBuddy OAuth</h1>
@@ -70,9 +70,9 @@ and works the same in CPA's own Management Center or any other panel that speaks
 CPA's management API.
 
 OAuth starts and polling use CPA's authenticated management API. Public plugin
-resources contain only two static marks and the optional description declaration:
-`workbuddy.svg`, `codebuddy-color.svg` and `omc.json`. A request to those routes
-cannot start a flow, and a query parameter never triggers an action.
+resources contain only three static marks and the optional description declaration:
+`logo.png`, `workbuddy.svg`, `codebuddy-color.svg` and `omc.json`. A request to those
+routes cannot start a flow, and a query parameter never triggers an action.
 
 Sign-in is the browser flow WorkBuddy's own desktop uses. The plugin asks
 WorkBuddy for a sign-in page, opens the page Tencent serves for that build, polls
@@ -192,7 +192,8 @@ and ecosystem development standards.
 ## Project layout
 
 ```text
-assets/workbuddy.svg        WorkBuddy mark: plugin logo and the China build's entry
+assets/logo.png             Plugin sticker: the plugin's face in a store
+assets/workbuddy.svg        WorkBuddy mark for the China build's sign-in entry
 assets/codebuddy-color.svg  CodeBuddy mark for the WorkBuddy AI entry
 go/                      Go/cgo plugin implementation and tests
 go/assets/               Embedded artwork and the omc.json declaration

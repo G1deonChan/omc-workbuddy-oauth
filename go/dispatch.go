@@ -58,7 +58,7 @@ func unmarshal(raw []byte, out any) error {
 // two cards are distinguishable at a glance.
 func authEntries() []pluginapi.AuthProviderEntry {
 	return []pluginapi.AuthProviderEntry{
-		{Identifier: siteWorkBuddy, Name: "WorkBuddy", Logo: resourceAssetURL(pluginLogo)},
+		{Identifier: siteWorkBuddy, Name: "WorkBuddy", Logo: resourceAssetURL(workbuddyMark)},
 		{Identifier: siteWorkBuddyAI, Name: "WorkBuddy AI", Logo: resourceAssetURL(aiLogo)},
 	}
 }
@@ -168,7 +168,8 @@ func handleMethod(method string, raw []byte) (any, error) {
 		return v, nil
 	case "management.register":
 		return map[string]any{"resources": []map[string]any{
-			{"path": "/" + pluginLogo, "menu": "", "description": "WorkBuddy mark, the plugin logo and the China build's sign-in entry."},
+			{"path": "/" + pluginLogo, "menu": "", "description": "Plugin sticker mark: the plugin's face in a store."},
+			{"path": "/" + workbuddyMark, "menu": "", "description": "WorkBuddy mark for the China build's sign-in entry."},
 			{"path": "/" + aiLogo, "menu": "", "description": "CodeBuddy mark for the WorkBuddy AI sign-in entry."},
 			{"path": "/omc.json", "menu": "", "description": "Public, optional OMC plugin declaration."},
 		}}, nil

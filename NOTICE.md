@@ -35,10 +35,14 @@ affiliated with or endorsed by them.
 ## Marks
 
 `assets/workbuddy.svg` is WorkBuddy's own mark, the artwork its clients and site
-publish. It is the plugin logo and the China build's sign-in card.
+publish. It is the China build's sign-in card.
 `assets/codebuddy-color.svg` is CodeBuddy's mark, which the international build's
 assets are served from; it is the WorkBuddy AI card. Both are used only to identify
-the service a credential signs in to, and this project publishes no mark of its own.
+the service a credential signs in to.
+
+`assets/logo.png` is this plugin's own face in a store: the WorkBuddy mark drawn on
+the OMC sticker the ecosystem's plugins share. It identifies the plugin rather than
+the service, and no sign-in card uses it.
 
 `go/assets/` holds the copies the plugin embeds and serves, and they must stay
 byte-identical to the files under `assets/`; the test suite compares them.

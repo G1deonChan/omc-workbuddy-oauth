@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/workbuddy.svg" width="96" height="96" alt="OMC WorkBuddy OAuth logo">
+  <img src="assets/logo.png" width="96" height="96" alt="OMC WorkBuddy OAuth logo">
 </p>
 
 <h1 align="center">OMC WorkBuddy OAuth</h1>
@@ -62,8 +62,8 @@ WorkBuddy 分为两个版本，它们是不同主机上的不同账号。两者�
 [Oh-My-CPA](https://github.com/WizisCool/oh-my-cpa) 中是一等公民，在 CPA 自带的
 Management Center 或任何对接 CPA 管理 API 的面板中表现一致。
 
-OAuth 发起和轮询使用 CPA 原生受认证管理 API。公共插件资源仅包含两个静态标识与可选的
-描述声明，即 `workbuddy.svg`、`codebuddy-color.svg` 与 `omc.json`。对这些路由的请求无法
+OAuth 发起和轮询使用 CPA 原生受认证管理 API。公共插件资源仅包含三个静态标识与可选的
+描述声明，即 `logo.png`、`workbuddy.svg`、`codebuddy-color.svg` 与 `omc.json`。对这些路由的请求无法
 发起登录流程，查询参数也不会触发任何动作。
 
 登录使用 WorkBuddy 自带桌面端所用的浏览器流程。插件向 WorkBuddy 申请登录页，打开腾讯为
@@ -169,7 +169,8 @@ omc-workbuddy-oauth.omc.json
 ## 项目结构
 
 ```text
-assets/workbuddy.svg        WorkBuddy 标识：插件 logo 与中国版登录入口
+assets/logo.png             插件贴纸：插件在商店中的标识
+assets/workbuddy.svg        WorkBuddy 标识：中国版登录入口
 assets/codebuddy-color.svg  CodeBuddy 标识：WorkBuddy AI（国际版）登录入口
 go/                      Go/cgo 插件实现与测试
 go/assets/               内嵌资源与 omc.json 声明

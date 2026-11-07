@@ -16,8 +16,10 @@ ROOT = Path(__file__).resolve().parents[2]
 OAUTH_ENTRIES = (("workbuddy", "WorkBuddy", "workbuddy.svg"), ("workbuddy-ai", "WorkBuddy AI", "codebuddy-color.svg"))
 CREDENTIAL_PROVIDER = "workbuddy"
 # Served artwork is compared against the embedded sources, so a stale or
-# swapped deployment cannot pass.
-SVG_ASSETS = (
+# swapped deployment cannot pass. The plugin's own sticker is a raster PNG; the
+# two provider marks are SVGs.
+ASSETS = (
+    ("logo.png", "image/png"),
     ("workbuddy.svg", "image/svg+xml"),
     ("codebuddy-color.svg", "image/svg+xml"),
 )
@@ -106,10 +108,10 @@ def smoke(library, version, descriptor):
                 raise ValueError(f"native {method} must stay on the workbuddy provider key")
         management = rpc("management.register", {})
         resources = management["resources"]
-        if [entry["path"] for entry in resources] != ["/workbuddy.svg", "/codebuddy-color.svg", "/omc.json"] or any(entry["menu"] for entry in resources) or management.get("routes"):
-            raise ValueError("native public resources must be exactly three passive assets with no menu")
+        if [entry["path"] for entry in resources] != ["/logo.png", "/workbuddy.svg", "/codebuddy-color.svg", "/omc.json"] or any(entry["menu"] for entry in resources) or management.get("routes"):
+            raise ValueError("native public resources must be exactly four passive assets with no menu")
         prefix = f"/v0/resource/plugins/{PLUGIN_ID}"
-        assets = {name: ((ROOT / "go" / "assets" / name).read_bytes(), content_type) for name, content_type in SVG_ASSETS}
+        assets = {name: ((ROOT / "go" / "assets" / name).read_bytes(), content_type) for name, content_type in ASSETS}
         assets["omc.json"] = (descriptor, "application/json; charset=utf-8")
         probes = 0
         for name, (expected, content_type) in assets.items():
