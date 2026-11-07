@@ -10,7 +10,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
-var pluginVersion = "0.1.4"
+var pluginVersion = "0.1.5"
 
 type rpcAuthStart struct {
 	pluginapi.AuthLoginStartRequest
@@ -77,6 +77,7 @@ func registration() any {
 				{Name: "max_concurrency", Type: pluginapi.ConfigFieldTypeInteger, Default: 3, Description: "Maximum simultaneous requests per credential (default 3)."},
 				{Name: "app_version", Type: pluginapi.ConfigFieldTypeString, Default: defaultAppVersion, Description: "WorkBuddy desktop version the client claims in its User-Agent (default 5.9.3). WorkBuddy refuses a chat that does not name a WorkBuddy client."},
 				{Name: "cli_version", Type: pluginapi.ConfigFieldTypeString, Default: defaultCLIVersion, Description: "WorkBuddy CLI version the client claims in its User-Agent (default 2.165.0)."},
+				{Name: "exclude_models", Type: pluginapi.ConfigFieldTypeArray, Default: []string{}, Description: "Model ids this plugin never advertises. WorkBuddy's product config lists models an account's plan does not include, and that is only learned by being refused; naming them here keeps CPA from routing those models to this credential in the first place. A refused model is otherwise hidden on its own for twelve hours."},
 			},
 		},
 		"capabilities": map[string]any{

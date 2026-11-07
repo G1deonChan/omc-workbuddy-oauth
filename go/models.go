@@ -292,7 +292,7 @@ func fetchListing(sender httpSender, c credential, spec siteSpec, force bool) []
 		listingCache.Lock()
 		if entry, ok := listingCache.entries[key]; ok && time.Since(entry.at) < listingTTL {
 			listingCache.Unlock()
-			return withoutDenied(c, entry.models)
+			return offerable(c, entry.models)
 		}
 		listingCache.Unlock()
 	}
@@ -302,9 +302,9 @@ func fetchListing(sender httpSender, c credential, spec siteSpec, force bool) []
 		entry, ok := listingCache.entries[key]
 		listingCache.Unlock()
 		if ok && len(entry.models) > 0 {
-			return withoutDenied(c, entry.models)
+			return offerable(c, entry.models)
 		}
-		return withoutDenied(c, fallbackModels(spec))
+		return offerable(c, fallbackModels(spec))
 	}
 	listingCache.Lock()
 	if listingCache.entries == nil {
@@ -312,7 +312,7 @@ func fetchListing(sender httpSender, c credential, spec siteSpec, force bool) []
 	}
 	listingCache.entries[key] = listingCacheEntry{at: time.Now(), models: models}
 	listingCache.Unlock()
-	return withoutDenied(c, models)
+	return offerable(c, models)
 }
 
 func readListing(sender httpSender, c credential, spec siteSpec) ([]workbuddyModel, error) {
@@ -350,9 +350,15 @@ func usableModels(spec siteSpec, body []byte) ([]workbuddyModel, error) {
 }
 
 // findModel looks a requested model up by key, case-insensitively. A miss
-// refreshes the list once before falling back to the shipped one.
+// refreshes the list once before falling back to the shipped one. A model the
+// configuration excludes is never found: a client that still asks for it (CPA
+// may hold a cached list) is answered as an unknown model, which the host reads
+// as a credential-model mismatch and routes elsewhere.
 func findModel(sender httpSender, c credential, spec siteSpec, model string) (workbuddyModel, bool) {
 	want := strings.ToLower(strings.TrimSpace(model))
+	if modelExcluded(want) {
+		return workbuddyModel{}, false
+	}
 	look := func(models []workbuddyModel) (workbuddyModel, bool) {
 		for _, m := range models {
 			if strings.ToLower(m.Key) == want {
@@ -417,7 +423,15 @@ func staticModels() pluginapi.ModelResponse {
 	if !ok {
 		spec, _ = siteFor(siteWorkBuddy)
 	}
-	return modelResponse(fallbackModels(spec))
+	models := fallbackModels(spec)
+	kept := make([]workbuddyModel, 0, len(models))
+	for _, m := range models {
+		if modelExcluded(m.Key) {
+			continue
+		}
+		kept = append(kept, m)
+	}
+	return modelResponse(kept)
 }
 
 func modelsForAuth(req pluginapi.AuthModelRequest, sender httpSender) (pluginapi.ModelResponse, error) {
@@ -447,10 +461,12 @@ var (
 	modelIDLike = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 )
 
-// denialTTL is how long a refused model stays out of the account's list. Long
-// enough that a probe or a client does not keep asking for it, short enough that
-// a plan that gains the model gets it back without a restart.
-const denialTTL = time.Hour
+// denialTTL is how long a refused model stays out of the account's list. It
+// matches the cooldown CPA applies to a credential for a model-support failure
+// (12 hours), so the list this plugin publishes and the routing state the host
+// keeps agree instead of disagreeing for eleven of those hours. A plan that
+// gains the model gets it back without a restart once the window passes.
+const denialTTL = 12 * time.Hour
 
 type modelDenial struct {
 	until    time.Time
@@ -460,20 +476,37 @@ type modelDenial struct {
 var denialMu sync.Mutex
 var denials = map[string]map[string]modelDenial{}
 
+// denialsLoaded records that the persisted refusals have been read into the
+// map, so a listing does not stat the document per model.
+var denialsLoaded bool
+
+// ensureDenials reads the persisted refusals once per process.
+func ensureDenials() {
+	denialMu.Lock()
+	loaded := denialsLoaded
+	denialMu.Unlock()
+	if loaded {
+		return
+	}
+	loadDenials()
+}
+
 // denyModel records that WorkBuddy refused model for this account, so the list it
-// publishes stops offering it and no request reaches the same refusal again.
+// publishes stops offering it and no request reaches the same refusal again. The
+// refusal is persisted, so a restart does not send the model upstream again.
 func denyModel(c credential, model, userType string) {
 	key := strings.ToLower(strings.TrimSpace(model))
 	if key == "" || c.UID == "" {
 		return
 	}
 	denialMu.Lock()
-	defer denialMu.Unlock()
 	account := listingKey(c)
 	if denials[account] == nil {
 		denials[account] = map[string]modelDenial{}
 	}
 	denials[account][key] = modelDenial{until: time.Now().Add(denialTTL), userType: strings.TrimSpace(userType)}
+	denialMu.Unlock()
+	saveDenials()
 }
 
 // modelDenied reports a model this account was refused, pruning what has lapsed.
@@ -481,6 +514,7 @@ func modelDenied(c credential, model string) bool {
 	key := strings.ToLower(strings.TrimSpace(model))
 	account := listingKey(c)
 	now := time.Now()
+	ensureDenials()
 	denialMu.Lock()
 	defer denialMu.Unlock()
 	entries := denials[account]
@@ -513,11 +547,12 @@ func refusedModel(message string) (model, userType string, ok bool) {
 	return "", "", false
 }
 
-// withoutDenied is the account's list without the models its plan refused.
-func withoutDenied(c credential, models []workbuddyModel) []workbuddyModel {
+// offerable is the account's list without what this credential must not
+// offer: a model its plan refused, and a model the configuration excludes.
+func offerable(c credential, models []workbuddyModel) []workbuddyModel {
 	out := make([]workbuddyModel, 0, len(models))
 	for _, m := range models {
-		if modelDenied(c, m.Key) {
+		if modelExcluded(m.Key) || modelDenied(c, m.Key) {
 			continue
 		}
 		out = append(out, m)

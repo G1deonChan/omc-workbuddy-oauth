@@ -36,6 +36,13 @@ plugins:
       # workbuddy (default) or workbuddy-ai. Only a fallback: a login request that
       # names an entry picks that entry's build.
       site: workbuddy
+      # Model ids this plugin never advertises. WorkBuddy's product config lists
+      # models an account's plan does not include, and that is only learned by
+      # being refused. Naming them here keeps CPA from routing those models to
+      # this credential at all, which matters when the credential has the highest
+      # priority and no other provider serves the model.
+      exclude_models: []
+      # exclude_models: [gpt-6-luna, gemini-3.8-flash]
 ```
 
 Use CPA's plugin store to install `omc-workbuddy-oauth`, or call:
@@ -254,13 +261,13 @@ caches it for ten minutes; a lookup that misses refreshes it once.
 - A model WorkBuddy refuses as not included in the account's plan — the
   international build answers `model [gpt-6.1-sol] is not allowed for user type
   [personal_free_user]` for a model its own config lists — is dropped from that
-  credential's list for an hour and reported to the client as a `400`
+  credential's list for twelve hours and reported to the client as a `400`
   (`model_not_allowed`) worded as the model not being available for the plan. Hiding
   it keeps a probe, a route or a client from reaching the same refusal again, and
   the wording keeps CPA's router treating the refusal as a credential-model
   mismatch: the request falls through to another credential or provider instead of
-  ending. The hour lapses on its own, so a plan that gains
-  the model gets it back without a restart.
+  ending. The refusal is remembered across restarts, and the window lapses on its
+  own, so a plan that gains the model gets it back without a restart.
 
 Execution is OpenAI chat completions in and out: the plugin receives OpenAI chat
 completion requests and answers in OpenAI chunks or in one OpenAI completion. CPA
@@ -360,7 +367,7 @@ sees the mapped status:
 | `403`, code `11128` (unapproved channel), `11153`, `11158` (no entitlement) | `403` with WorkBuddy's message |
 | `429`, code `14018` | `429`, rate limited, with WorkBuddy's message including when the allowance resets |
 | `400`, code `10085` (client identity refused) | `400` with WorkBuddy's message |
-| A `400` saying `model [...] is not allowed for user type [...]` | `400`, code `model_not_allowed`, worded as the model not being available for the plan; the model is hidden from that credential's list for an hour |
+| A `400` saying `model [...] is not allowed for user type [...]` | `400`, code `model_not_allowed`, worded as the model not being available for the plan; the model is hidden from that credential's list for twelve hours |
 | A `400` saying `prompt is too long` | `400`, worded as the prompt being longer than the model takes |
 | Any other `4xx` | The upstream status with WorkBuddy's message and code |
 | `5xx` | `502` |
@@ -435,9 +442,13 @@ Other behaviour worth knowing:
   for your plan (personal_free_user)`:** WorkBuddy listed a model its plan does not
   include for this account, and a request for it was refused. From 0.1.1 the plugin
   reports that as a `400` (`model_not_allowed`) and hides the model from the
-  credential for an hour, so it is neither offered nor retried; the message is worded
+  credential for twelve hours, so it is neither offered nor retried; the message is worded
   so CPA's router treats it as a credential-model mismatch and falls through to
-  another credential or provider rather than ending the request. The warning CPA
+  another credential or provider rather than ending the request. If no other
+  provider in the deployment serves that model, the request still fails with this
+  message: there is nothing to fall through to, which is the routing layer's
+  answer, not the plugin's. To keep such a model off this credential from the first
+  request, name it in `exclude_models`. The warning CPA
   already recorded is cleared by the next successful request on that credential.
   Nothing is wrong with the sign-in, and signing in again changes nothing.
 - **Login fails with `CPA auth directory unavailable`:** CPA reported no auth

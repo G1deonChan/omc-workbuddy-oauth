@@ -5,6 +5,8 @@ import (
 	"errors"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -69,6 +71,7 @@ func resetPluginState() {
 	flowMu.Unlock()
 	denialMu.Lock()
 	denials = map[string]map[string]modelDenial{}
+	denialsLoaded = false
 	denialMu.Unlock()
 	_ = configure(nil)
 }
@@ -564,10 +567,10 @@ func TestDenialsArePerAccountAndLapse(t *testing.T) {
 	two := credential{Site: siteWorkBuddyAI, UID: "u-2"}
 	models := []workbuddyModel{{Key: "gpt-6.1-sol"}, {Key: "gpt-5.5"}}
 	denyModel(one, "GPT-6.1-SOL", "personal_free_user")
-	if got := withoutDenied(one, models); len(got) != 1 || got[0].Key != "gpt-5.5" {
+	if got := offerable(one, models); len(got) != 1 || got[0].Key != "gpt-5.5" {
 		t.Fatalf("one account sees %v", got)
 	}
-	if got := withoutDenied(two, models); len(got) != 2 {
+	if got := offerable(two, models); len(got) != 2 {
 		t.Fatalf("another account sees %v", got)
 	}
 	denialMu.Lock()
@@ -576,8 +579,105 @@ func TestDenialsArePerAccountAndLapse(t *testing.T) {
 		denials[listingKey(one)][key] = entry
 	}
 	denialMu.Unlock()
-	if got := withoutDenied(one, models); len(got) != 2 {
+	if got := offerable(one, models); len(got) != 2 {
 		t.Fatalf("a lapsed refusal still hides %v", got)
+	}
+}
+
+func TestExcludedModelsAreNeverAdvertised(t *testing.T) {
+	resetPluginState()
+	if err := configure([]byte("exclude_models: [gpt-6-luna, \"GLM-5.3\"]\n")); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = configure(nil) }()
+	sender := &fakeSender{reply: func(req pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error) {
+		return jsonReply(200, `{"code":0,"data":{"agents":[{"name":"cli","models":["gpt-6-luna","glm-5.3","gpt-5.5"]}],"models":[{"id":"gpt-6-luna"},{"id":"glm-5.3"},{"id":"gpt-5.5"}]}}`), nil
+	}}
+	storage := testCredential(siteWorkBuddyAI)
+	models, err := modelsForAuth(pluginapi.AuthModelRequest{StorageJSON: storage}, sender)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ids []string
+	for _, m := range models.Models {
+		ids = append(ids, m.ID)
+	}
+	if strings.Join(ids, ",") != "gpt-5.5" {
+		t.Fatalf("models = %v", ids)
+	}
+	// A client that still asks for an excluded model (CPA may hold a cached
+	// list) is answered as an unknown model, which the host reads as a
+	// credential-model mismatch and routes elsewhere.
+	body, _ := json.Marshal(map[string]any{"model": "gpt-6-luna", "messages": []map[string]any{{"role": "user", "content": "hi"}}})
+	_, err = execute(pluginapi.ExecutorRequest{Model: "gpt-6-luna", Payload: body, StorageJSON: storage}, sender)
+	var perr *pluginabi.Error
+	if !errors.As(err, &perr) || perr.Code != "unknown_model" {
+		t.Fatalf("err = %#v", err)
+	}
+	// The shipped fallback list honours the same configuration.
+	for _, m := range staticModels().Models {
+		if m.ID == "gpt-6-luna" {
+			t.Fatal("the static list still advertises an excluded model")
+		}
+	}
+}
+
+func TestAnExcludeEntryThatIsNotAModelIdIsRefused(t *testing.T) {
+	resetPluginState()
+	defer func() { _ = configure(nil) }()
+	for _, raw := range []string{
+		"exclude_models: [\"not a model id\"]\n",
+		"exclude_models: [\"gpt-6-luna/../x\"]\n",
+	} {
+		if err := configure([]byte(raw)); err == nil {
+			t.Fatalf("%q was accepted", raw)
+		}
+	}
+}
+
+func TestARefusalOutlivesTheProcess(t *testing.T) {
+	resetPluginState()
+	dir := t.TempDir()
+	setAuthDir(dir)
+	defer setAuthDir("")
+	one := credential{Site: siteWorkBuddyAI, UID: "user-1"}
+	denyModel(one, "gpt-6-luna", "personal_free_user")
+	if !modelDenied(one, "gpt-6-luna") {
+		t.Fatal("the refusal was not recorded")
+	}
+	// Forget everything the process holds, as a restart would. The next question
+	// is answered from the document, not from memory.
+	if _, err := os.Stat(filepath.Join(dir, denialsFileName)); err != nil {
+		t.Fatalf("the refusal was not written: %v", err)
+	}
+	denialMu.Lock()
+	denials = map[string]map[string]modelDenial{}
+	denialsLoaded = false
+	denialMu.Unlock()
+	if !modelDenied(one, "gpt-6-luna") {
+		t.Fatal("the refusal was not read back from disk")
+	}
+	// A different account is not affected by another's refusal.
+	if modelDenied(credential{Site: siteWorkBuddyAI, UID: "user-2"}, "gpt-6-luna") {
+		t.Fatal("one account's refusal hid another account's model")
+	}
+	// A lapsed record is not read back either.
+	denialMu.Lock()
+	for account, models := range denials {
+		for model, record := range models {
+			record.until = time.Now().Add(-time.Minute)
+			models[model] = record
+		}
+		denials[account] = models
+	}
+	denialMu.Unlock()
+	saveDenials()
+	denialMu.Lock()
+	denials = map[string]map[string]modelDenial{}
+	denialsLoaded = false
+	denialMu.Unlock()
+	if modelDenied(one, "gpt-6-luna") {
+		t.Fatal("a lapsed refusal was read back")
 	}
 }
 

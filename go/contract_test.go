@@ -30,13 +30,22 @@ func TestRegistrationContract(t *testing.T) {
 	if meta.Logo != publicAssetBaseURL+pluginLogo {
 		t.Fatalf("logo = %q", meta.Logo)
 	}
-	if len(meta.ConfigFields) != 4 {
+	if len(meta.ConfigFields) != 5 {
 		t.Fatalf("config fields = %+v", meta.ConfigFields)
 	}
 	for _, field := range meta.ConfigFields {
 		if field.Default == nil || field.Description == "" {
 			t.Fatalf("field %q has no default or description", field.Name)
 		}
+	}
+	var exclude *pluginapi.ConfigField
+	for i := range meta.ConfigFields {
+		if meta.ConfigFields[i].Name == "exclude_models" {
+			exclude = &meta.ConfigFields[i]
+		}
+	}
+	if exclude == nil || exclude.Type != pluginapi.ConfigFieldTypeArray {
+		t.Fatalf("exclude_models field = %+v", exclude)
 	}
 	caps := reg["capabilities"].(map[string]any)
 	if caps["executor_input_formats"].([]string)[0] != "openai" || caps["executor_output_formats"].([]string)[0] != "openai" {
