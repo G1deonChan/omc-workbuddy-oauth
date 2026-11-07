@@ -162,6 +162,11 @@ rather than falling back to the configuration.
    agent. A token completes this step; code `11217` means the page is still open and
    keeps the flow pending; a transient status (`408`, `429`, `5xx`) keeps it pending
    too; another `4xx` ends the flow with WorkBuddy's message.
+
+   The page finishes at WorkBuddy's `/login/started`, which asks the browser to open
+   the WorkBuddy desktop app. **Cancel that prompt.** It is the vendor's hand-off to
+   its own client, the sign-in is already complete at that point, and CPA has the
+   token: the panel shows the credential either way.
 4. `GET /v2/plugin/login/account?state=<state>` names the account: its uid, nickname,
    phone number, and an enterprise id and name when it is a team or education
    account. Code `12151` means the account is not named yet and keeps the flow
@@ -246,6 +251,14 @@ caches it for ten minutes; a lookup that misses refreshes it once.
   Gemini, GLM, Hy3, Kimi and MiniMax).
 - A `vendor/model` prefix is trimmed before lookup, so a prefixed ID resolves to the
   same entry.
+- A model WorkBuddy refuses as not included in the account's plan — the
+  international build answers `model [gpt-6.1-sol] is not allowed for user type
+  [personal_free_user]` for a model its own config lists — is dropped from that
+  credential's list for an hour and reported to the client as a `400`
+  (`model_not_allowed`) that names the plan. Hiding it keeps a probe, a route or a
+  client from reaching the same refusal again, and keeps a model-level refusal from
+  reading as a credential fault. The hour lapses on its own, so a plan that gains
+  the model gets it back without a restart.
 
 Execution is OpenAI chat completions in and out: the plugin receives OpenAI chat
 completion requests and answers in OpenAI chunks or in one OpenAI completion. CPA
@@ -345,6 +358,7 @@ sees the mapped status:
 | `403`, code `11128` (unapproved channel), `11153`, `11158` (no entitlement) | `403` with WorkBuddy's message |
 | `429`, code `14018` | `429`, rate limited, with WorkBuddy's message including when the allowance resets |
 | `400`, code `10085` (client identity refused) | `400` with WorkBuddy's message |
+| A `400` saying `model [...] is not allowed for user type [...]` | `400`, code `model_not_allowed`, naming the plan; the model is hidden from that credential's list for an hour |
 | A `400` saying `prompt is too long` | `400`, worded as the prompt being longer than the model takes |
 | Any other `4xx` | The upstream status with WorkBuddy's message and code |
 | `5xx` | `502` |
@@ -391,6 +405,13 @@ Other behaviour worth knowing:
   the meantime.
 - **`403` on a model that is listed:** the account is not entitled to that model
   (WorkBuddy code `11158`), or its plan does not include it.
+- **The credential shows a warning like `model [gpt-6.1-sol] is not allowed for
+  user type [personal_free_user]`:** WorkBuddy listed a model its plan does not
+  include for this account, and a request for it was refused. From 0.1.1 the plugin
+  reports that as a request fault (`400`, `model_not_allowed`) and hides the model
+  from the credential for an hour, so it is neither offered nor retried; the warning
+  CPA already recorded is cleared by the next successful request on that credential.
+  Nothing is wrong with the sign-in, and signing in again changes nothing.
 - **Login fails with `CPA auth directory unavailable`:** CPA reported no auth
   directory to the plugin. Set one, and keep it writable: it holds the state key and
   the pending flows.
