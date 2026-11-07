@@ -292,7 +292,7 @@ func fetchListing(sender httpSender, c credential, spec siteSpec, force bool) []
 		listingCache.Lock()
 		if entry, ok := listingCache.entries[key]; ok && time.Since(entry.at) < listingTTL {
 			listingCache.Unlock()
-			return entry.models
+			return withoutDenied(c, entry.models)
 		}
 		listingCache.Unlock()
 	}
@@ -302,9 +302,9 @@ func fetchListing(sender httpSender, c credential, spec siteSpec, force bool) []
 		entry, ok := listingCache.entries[key]
 		listingCache.Unlock()
 		if ok && len(entry.models) > 0 {
-			return entry.models
+			return withoutDenied(c, entry.models)
 		}
-		return fallbackModels(spec)
+		return withoutDenied(c, fallbackModels(spec))
 	}
 	listingCache.Lock()
 	if listingCache.entries == nil {
@@ -312,7 +312,7 @@ func fetchListing(sender httpSender, c credential, spec siteSpec, force bool) []
 	}
 	listingCache.entries[key] = listingCacheEntry{at: time.Now(), models: models}
 	listingCache.Unlock()
-	return models
+	return withoutDenied(c, models)
 }
 
 func readListing(sender httpSender, c credential, spec siteSpec) ([]workbuddyModel, error) {
@@ -430,6 +430,99 @@ func modelsForAuth(req pluginapi.AuthModelRequest, sender httpSender) (pluginapi
 		return pluginapi.ModelResponse{}, errors.New("invalid WorkBuddy credential")
 	}
 	return modelResponse(fetchListing(sender, c, spec, false)), nil
+}
+
+// deniedFor is WorkBuddy refusing a model this account's plan does not include.
+// The international build answers a request to such a model with
+//
+//	model [gpt-6.1-sol] is not allowed for user type [personal_free_user]
+//
+// although its config lists the model. The China build phrases the same refusal
+// in Chinese; cnDeniedFor matches that shape too, and only when the bracket holds
+// something that reads as a model id, so a sentence about a plan cannot hide a
+// model by accident.
+var (
+	deniedFor   = regexp.MustCompile(`(?i)model\s*\[([^\]\s]{1,128})\]\s*is not allowed for user type(?:\s*\[([^\]]{1,64})\])?`)
+	cnDeniedFor = regexp.MustCompile(`模型\s*\[([^\]\s]{1,128})\]\s*(?:[^。，,]{0,24})?(?:不允许|不支持|无权限)(?:[^。]{0,24})?用户类型(?:\s*\[([^\]]{1,64})\])?`)
+	modelIDLike = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
+)
+
+// denialTTL is how long a refused model stays out of the account's list. Long
+// enough that a probe or a client does not keep asking for it, short enough that
+// a plan that gains the model gets it back without a restart.
+const denialTTL = time.Hour
+
+type modelDenial struct {
+	until    time.Time
+	userType string
+}
+
+var denialMu sync.Mutex
+var denials = map[string]map[string]modelDenial{}
+
+// denyModel records that WorkBuddy refused model for this account, so the list it
+// publishes stops offering it and no request reaches the same refusal again.
+func denyModel(c credential, model, userType string) {
+	key := strings.ToLower(strings.TrimSpace(model))
+	if key == "" || c.UID == "" {
+		return
+	}
+	denialMu.Lock()
+	defer denialMu.Unlock()
+	account := listingKey(c)
+	if denials[account] == nil {
+		denials[account] = map[string]modelDenial{}
+	}
+	denials[account][key] = modelDenial{until: time.Now().Add(denialTTL), userType: strings.TrimSpace(userType)}
+}
+
+// modelDenied reports a model this account was refused, pruning what has lapsed.
+func modelDenied(c credential, model string) bool {
+	key := strings.ToLower(strings.TrimSpace(model))
+	account := listingKey(c)
+	now := time.Now()
+	denialMu.Lock()
+	defer denialMu.Unlock()
+	entries := denials[account]
+	if entries == nil {
+		return false
+	}
+	if d, ok := entries[key]; ok {
+		if d.until.After(now) {
+			return true
+		}
+		delete(entries, key)
+	}
+	return false
+}
+
+// refusedModel reads the model and the plan a refusal names, when the refusal is
+// one of the plan's.
+func refusedModel(message string) (model, userType string, ok bool) {
+	for _, re := range []*regexp.Regexp{deniedFor, cnDeniedFor} {
+		m := re.FindStringSubmatch(message)
+		if m == nil || !modelIDLike.MatchString(m[1]) {
+			continue
+		}
+		user := ""
+		if len(m) > 2 {
+			user = strings.TrimSpace(m[2])
+		}
+		return m[1], user, true
+	}
+	return "", "", false
+}
+
+// withoutDenied is the account's list without the models its plan refused.
+func withoutDenied(c credential, models []workbuddyModel) []workbuddyModel {
+	out := make([]workbuddyModel, 0, len(models))
+	for _, m := range models {
+		if modelDenied(c, m.Key) {
+			continue
+		}
+		out = append(out, m)
+	}
+	return out
 }
 
 // modelPrefix matches a provider prefix a client may put on a model id.

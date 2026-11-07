@@ -400,6 +400,19 @@ func classifyUpstream(c credential, status int, body []byte) error {
 			message = "WorkBuddy refused an agent identity line in this prompt (11128): " + message
 		}
 	}
+	// A plan that does not include a model says nothing about the credential's
+	// health: the model is hidden from this account's list and the refusal is
+	// reported as a request fault, so the credential is not parked for it.
+	if model, plan, ok := refusedModel(message); ok {
+		denyModel(c, model, plan)
+		who := ""
+		if plan != "" {
+			who = " (" + plan + ")"
+		}
+		return pluginabi.NewError("model_not_allowed",
+			fmt.Sprintf("%s: this account's plan%s does not include %s; the model is hidden from this credential's list", site.Name, who, model),
+			http.StatusBadRequest)
+	}
 	// The codes are more specific than the status: a refusal carried inside an OK
 	// stream has no status at all, and an unapproved-channel refusal is 403
 	// whatever the transport said.

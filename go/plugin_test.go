@@ -67,6 +67,9 @@ func resetPluginState() {
 	flowMu.Lock()
 	pendingFlows = map[string]pendingFlow{}
 	flowMu.Unlock()
+	denialMu.Lock()
+	denials = map[string]map[string]modelDenial{}
+	denialMu.Unlock()
 	_ = configure(nil)
 }
 
@@ -192,6 +195,9 @@ func TestPollLoginEndsAFlowItCannotResume(t *testing.T) {
 	flowMu.Lock()
 	pendingFlows = map[string]pendingFlow{}
 	flowMu.Unlock()
+	denialMu.Lock()
+	denials = map[string]map[string]modelDenial{}
+	denialMu.Unlock()
 	poll, err := pollLogin(pluginapi.AuthLoginPollRequest{State: start.State, Host: pluginapi.HostConfigSummary{AuthDir: dir}}, &fakeSender{})
 	if err != nil {
 		t.Fatal(err)
@@ -523,6 +529,91 @@ func TestExecuteStreamRejectsARefusalInsideAnOKStream(t *testing.T) {
 	var perr *pluginabi.Error
 	if !errors.As(err, &perr) || perr.HTTPStatus != http.StatusForbidden {
 		t.Fatalf("err = %#v", err)
+	}
+}
+
+func TestRefusedModelIsReadFromBothWordings(t *testing.T) {
+	model, plan, ok := refusedModel("model [gpt-6.1-sol] is not allowed for user type [personal_free_user]")
+	if !ok || model != "gpt-6.1-sol" || plan != "personal_free_user" {
+		t.Fatalf("english = %q %q %v", model, plan, ok)
+	}
+	model, plan, ok = refusedModel("模型 [glm-5.3] 不允许当前用户类型 [personal_free_user] 使用")
+	if !ok || model != "glm-5.3" || plan != "personal_free_user" {
+		t.Fatalf("chinese = %q %q %v", model, plan, ok)
+	}
+	for _, message := range []string{
+		"the model list is not allowed for user type",
+		"model [not a model id] is not allowed for user type [personal_free_user]",
+		"insufficient credits",
+	} {
+		if _, _, ok := refusedModel(message); ok {
+			t.Fatalf("%q was read as a plan refusal", message)
+		}
+	}
+}
+
+func TestDenialsArePerAccountAndLapse(t *testing.T) {
+	resetPluginState()
+	one := credential{Site: siteWorkBuddyAI, UID: "u-1"}
+	two := credential{Site: siteWorkBuddyAI, UID: "u-2"}
+	models := []workbuddyModel{{Key: "gpt-6.1-sol"}, {Key: "gpt-5.5"}}
+	denyModel(one, "GPT-6.1-SOL", "personal_free_user")
+	if got := withoutDenied(one, models); len(got) != 1 || got[0].Key != "gpt-5.5" {
+		t.Fatalf("one account sees %v", got)
+	}
+	if got := withoutDenied(two, models); len(got) != 2 {
+		t.Fatalf("another account sees %v", got)
+	}
+	denialMu.Lock()
+	for key, entry := range denials[listingKey(one)] {
+		entry.until = time.Now().Add(-time.Minute)
+		denials[listingKey(one)][key] = entry
+	}
+	denialMu.Unlock()
+	if got := withoutDenied(one, models); len(got) != 2 {
+		t.Fatalf("a lapsed refusal still hides %v", got)
+	}
+}
+
+func TestAModelThePlanRefusesIsHiddenAndNotRetried(t *testing.T) {
+	resetPluginState()
+	chats := 0
+	sender := &fakeSender{reply: func(req pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error) {
+		switch {
+		case strings.HasSuffix(req.URL, "/v3/config"):
+			return jsonReply(200, `{"code":0,"data":{"agents":[{"name":"cli","models":["gpt-6.1-sol","gpt-5.5"]}],"models":[{"id":"gpt-6.1-sol"},{"id":"gpt-5.5"}]}}`), nil
+		default:
+			chats++
+			return jsonReply(400, `{"code":400,"msg":"model [gpt-6.1-sol] is not allowed for user type [personal_free_user]"}`), nil
+		}
+	}}
+	body, _ := json.Marshal(map[string]any{"model": "gpt-6.1-sol", "messages": []map[string]any{{"role": "user", "content": "hi"}}})
+	storage := testCredential(siteWorkBuddyAI)
+	_, err := execute(pluginapi.ExecutorRequest{Model: "gpt-6.1-sol", Payload: body, StorageJSON: storage}, sender)
+	var perr *pluginabi.Error
+	if !errors.As(err, &perr) || perr.HTTPStatus != http.StatusBadRequest || perr.Code != "model_not_allowed" {
+		t.Fatalf("err = %#v", err)
+	}
+	if !strings.Contains(perr.Message, "gpt-6.1-sol") || !strings.Contains(perr.Message, "personal_free_user") {
+		t.Fatalf("message = %q", perr.Message)
+	}
+	models, err := modelsForAuth(pluginapi.AuthModelRequest{StorageJSON: storage}, sender)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ids []string
+	for _, m := range models.Models {
+		ids = append(ids, m.ID)
+	}
+	if strings.Join(ids, ",") != "gpt-5.5" {
+		t.Fatalf("models = %v", ids)
+	}
+	_, err = execute(pluginapi.ExecutorRequest{Model: "gpt-6.1-sol", Payload: body, StorageJSON: storage}, sender)
+	if !errors.As(err, &perr) || perr.Code != "unknown_model" {
+		t.Fatalf("second err = %#v", err)
+	}
+	if chats != 1 {
+		t.Fatalf("the refused model was sent %d times", chats)
 	}
 }
 
