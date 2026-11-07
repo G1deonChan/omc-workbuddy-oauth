@@ -176,6 +176,21 @@ func closeStream(id, message string) {
 	_ = hostRPC("host.stream.close", map[string]any{"stream_id": id, "error": message}, nil)
 }
 
+// closeStreamWithError ends a stream with the structured error the host's router
+// reads: without error_detail the host sees a statusless plugin failure and
+// answers every mid-stream refusal as a 500, so a 403 entitlement or a 429 rate
+// limit never reaches the routing and cooldown decisions. An error that carries
+// no pluginabi.Error is closed without one.
+func closeStreamWithError(id, message string, err error) {
+	var detail *pluginabi.Error
+	_ = errors.As(err, &detail)
+	if detail == nil {
+		closeStream(id, message)
+		return
+	}
+	_ = hostRPC("host.stream.close", map[string]any{"stream_id": id, "error": message, "error_detail": detail}, nil)
+}
+
 // readWholeStream drains and closes a host HTTP stream, with a bound so a
 // misbehaving upstream cannot exhaust memory.
 func readWholeStream(id string) ([]byte, error) {
@@ -198,9 +213,10 @@ func readWholeStream(id string) ([]byte, error) {
 
 // Streaming seams. Tests replace them to exercise the pump without a plugin host.
 var (
-	readStreamChunk = readHostStream
-	emitStreamFrame = emitStreamChunk
-	openHTTPStream  = openUpstreamStream
+	readStreamChunk     = readHostStream
+	emitStreamFrame     = emitStreamChunk
+	openHTTPStream      = openUpstreamStream
+	closeHostStreamWith = closeStreamWithError
 	// pumpFinished is nil in production; a test sets it to learn that a pump has
 	// returned before it puts the seams above back.
 	pumpFinished func(source string)
@@ -212,16 +228,18 @@ func openUpstreamStream(plan requestPlan, callbackID string) (hostStreamResponse
 	return response, err
 }
 
-// streamPump copies one WorkBuddy event stream into the host stream. WorkBuddy
-// answers in OpenAI chunks, so a frame is forwarded as it came: CPA does the
-// client's protocol translation.
+// streamPump copies one WorkBuddy event stream into the host stream. A frame
+// is forwarded as its bare data payload: the host's OpenAI handler adds the
+// "data: " prefix, the blank line and the [DONE] marker itself, and a host
+// that forwards plugin chunks unchanged (older CPA does) would otherwise
+// wrap the frame again and send the client "data: data: {...}", which its
+// JSON parser refuses. An event with no data (a comment, a keep-alive) is
+// not forwarded.
 type streamPump struct {
 	source     string
 	target     string
 	buffer     sseBuffer
 	credential credential
-	doneSeen   bool
-	emitted    bool
 }
 
 // pumpStart is what the pump found before the client was answered: the stream's
@@ -270,17 +288,16 @@ func (p *streamPump) first(ready chan<- pumpStart) pumpStart {
 }
 
 // deliver forwards complete events, and reports false when the client's stream is
-// gone.
+// gone. The bare data payload is what the host accepts: it adds SSE framing itself.
 func (p *streamPump) deliver(frames []sseFrame) bool {
 	for _, frame := range frames {
-		if isDone(frame.Data) {
-			p.doneSeen = true
+		if isDone(frame.Data) || len(bytes.TrimSpace(frame.Data)) == 0 {
+			continue
 		}
-		if emitStreamFrame(p.target, frame.Raw) != nil {
+		if emitStreamFrame(p.target, frame.Data) != nil {
 			closeStream(p.target, "client stream closed")
 			return false
 		}
-		p.emitted = true
 	}
 	return true
 }
@@ -289,7 +306,7 @@ func (p *streamPump) run() {
 	for {
 		r, err := readStreamChunk(p.source)
 		if err != nil {
-			closeStream(p.target, streamFailureMessage(err))
+			closeHostStreamWith(p.target, streamFailureMessage(err), transportFailure(err))
 			return
 		}
 		if !p.deliver(p.buffer.push(r.Payload)) {
@@ -299,9 +316,9 @@ func (p *streamPump) run() {
 			if !p.deliver(p.buffer.flush()) {
 				return
 			}
-			if !p.doneSeen && p.emitted {
-				_ = emitStreamFrame(p.target, []byte("data: [DONE]\n\n"))
-			}
+			// The host writes the terminal marker itself: its handler ends the
+			// client's stream, and its translator tail turns the stream's end
+			// into whatever the client's protocol closes with.
 			closeStream(p.target, "")
 			return
 		}
@@ -357,8 +374,9 @@ func executeStream(req pluginapi.ExecutorRequest, callbackID, streamID string, s
 		if start.err != nil {
 			if answered {
 				// The client has the stream; end it with the refusal instead of
-				// leaving it open.
-				closeStream(pump.target, start.err.Error())
+				// leaving it open. The structured detail keeps the refusal's own
+				// status for the host's routing.
+				closeHostStreamWith(pump.target, start.err.Error(), start.err)
 			}
 			return
 		}
@@ -453,9 +471,11 @@ func classifyUpstream(c credential, status int, body []byte) error {
 			message = "WorkBuddy refused an agent identity line in this prompt (11128): " + message
 		}
 	}
-	// A plan that does not include a model says nothing about the credential's
-	// health: the model is hidden from this account's list and the refusal is
-	// reported as a request fault, so the credential is not parked for it.
+	// A plan that does not include a model says nothing about the request: the
+	// model is hidden from this account's list, and the credential stays healthy.
+	// The message says the model is not available for the plan, the wording CPA's
+	// router reads as a credential-model mismatch rather than a request fault, so
+	// the request falls through to another credential or provider.
 	if model, plan, ok := refusedModel(message); ok {
 		denyModel(c, model, plan)
 		who := ""
@@ -463,7 +483,7 @@ func classifyUpstream(c credential, status int, body []byte) error {
 			who = " (" + plan + ")"
 		}
 		return pluginabi.NewError("model_not_allowed",
-			fmt.Sprintf("%s: this account's plan%s does not include %s; the model is hidden from this credential's list", site.Name, who, model),
+			fmt.Sprintf("%s: %s is not available for your plan%s; the model is hidden from this credential's list", site.Name, model, who),
 			http.StatusBadRequest)
 	}
 	// The codes are more specific than the status: a refusal carried inside an OK

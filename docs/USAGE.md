@@ -255,9 +255,11 @@ caches it for ten minutes; a lookup that misses refreshes it once.
   international build answers `model [gpt-6.1-sol] is not allowed for user type
   [personal_free_user]` for a model its own config lists — is dropped from that
   credential's list for an hour and reported to the client as a `400`
-  (`model_not_allowed`) that names the plan. Hiding it keeps a probe, a route or a
-  client from reaching the same refusal again, and keeps a model-level refusal from
-  reading as a credential fault. The hour lapses on its own, so a plan that gains
+  (`model_not_allowed`) worded as the model not being available for the plan. Hiding
+  it keeps a probe, a route or a client from reaching the same refusal again, and
+  the wording keeps CPA's router treating the refusal as a credential-model
+  mismatch: the request falls through to another credential or provider instead of
+  ending. The hour lapses on its own, so a plan that gains
   the model gets it back without a restart.
 
 Execution is OpenAI chat completions in and out: the plugin receives OpenAI chat
@@ -358,7 +360,7 @@ sees the mapped status:
 | `403`, code `11128` (unapproved channel), `11153`, `11158` (no entitlement) | `403` with WorkBuddy's message |
 | `429`, code `14018` | `429`, rate limited, with WorkBuddy's message including when the allowance resets |
 | `400`, code `10085` (client identity refused) | `400` with WorkBuddy's message |
-| A `400` saying `model [...] is not allowed for user type [...]` | `400`, code `model_not_allowed`, naming the plan; the model is hidden from that credential's list for an hour |
+| A `400` saying `model [...] is not allowed for user type [...]` | `400`, code `model_not_allowed`, worded as the model not being available for the plan; the model is hidden from that credential's list for an hour |
 | A `400` saying `prompt is too long` | `400`, worded as the prompt being longer than the model takes |
 | Any other `4xx` | The upstream status with WorkBuddy's message and code |
 | `5xx` | `502` |
@@ -379,7 +381,10 @@ Other behaviour worth knowing:
   CPA can decide whether another credential should carry the request.
 - A refusal that arrives inside an `OK` stream keeps its real status: streaming
   requests read up to the first answer event before any chunk reaches the client.
-- A stream frame is forwarded as it came, and the stream ends with `data: [DONE]`.
+- A stream event is forwarded as its bare data payload. The host's OpenAI handler
+  adds the `data:` prefix, the blank lines and the terminal `[DONE]` marker itself, so
+  the payload reaches the client exactly once whatever the host's own forwarding does.
+  The plugin forwards no framing of its own.
 - A non-streaming answer with no text, no reasoning and no tool call is reported as
   `502` rather than an empty `200`.
 - Panics are caught at the plugin boundary and answered as a machine-coded error, and
@@ -426,12 +431,14 @@ Other behaviour worth knowing:
   answered; raise CPA's timeout for the route, or stream it.
 - **`403` on a model that is listed:** the account is not entitled to that model
   (WorkBuddy code `11158`), or its plan does not include it.
-- **The credential shows a warning like `model [gpt-6.1-sol] is not allowed for
-  user type [personal_free_user]`:** WorkBuddy listed a model its plan does not
+- **The credential shows a warning like `WorkBuddy AI: gpt-6.1-sol is not available
+  for your plan (personal_free_user)`:** WorkBuddy listed a model its plan does not
   include for this account, and a request for it was refused. From 0.1.1 the plugin
-  reports that as a request fault (`400`, `model_not_allowed`) and hides the model
-  from the credential for an hour, so it is neither offered nor retried; the warning
-  CPA already recorded is cleared by the next successful request on that credential.
+  reports that as a `400` (`model_not_allowed`) and hides the model from the
+  credential for an hour, so it is neither offered nor retried; the message is worded
+  so CPA's router treats it as a credential-model mismatch and falls through to
+  another credential or provider rather than ending the request. The warning CPA
+  already recorded is cleared by the next successful request on that credential.
   Nothing is wrong with the sign-in, and signing in again changes nothing.
 - **Login fails with `CPA auth directory unavailable`:** CPA reported no auth
   directory to the plugin. Set one, and keep it writable: it holds the state key and

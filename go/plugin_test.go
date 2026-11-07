@@ -502,8 +502,14 @@ func TestExecuteStreamForwardsFrames(t *testing.T) {
 		t.Fatal("the stream pump never returned")
 	}
 	joined := string(bytesJoin(emitted))
-	if !strings.Contains(joined, "\"content\":\"Hi\"") || !strings.Contains(joined, "data: [DONE]") {
+	if !strings.Contains(joined, "\"content\":\"Hi\"") {
 		t.Fatalf("frames = %q", joined)
+	}
+	// The pump forwards bare data payloads: the host's handler owns the SSE
+	// framing, and a framed payload would be wrapped again by a host that
+	// forwards plugin chunks unchanged ("data: data: {...}").
+	if strings.Contains(joined, "data:") || strings.Contains(joined, "[DONE]") {
+		t.Fatalf("frames carry SSE framing = %q", joined)
 	}
 }
 
@@ -614,6 +620,87 @@ func TestAModelThePlanRefusesIsHiddenAndNotRetried(t *testing.T) {
 	}
 	if chats != 1 {
 		t.Fatalf("the refused model was sent %d times", chats)
+	}
+}
+
+func TestAPlanRefusalIsWordedForTheRoutersFallback(t *testing.T) {
+	resetPluginState()
+	sender := &fakeSender{reply: func(req pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error) {
+		switch {
+		case strings.HasSuffix(req.URL, "/v3/config"):
+			return jsonReply(200, `{"code":0,"data":{"agents":[{"name":"cli","models":["gemini-3.8-flash"]}],"models":[{"id":"gemini-3.8-flash"}]}}`), nil
+		default:
+			return jsonReply(400, `{"code":400,"msg":"model [gemini-3.8-flash] is not allowed for user type [personal_free_user]"}`), nil
+		}
+	}}
+	body, _ := json.Marshal(map[string]any{"model": "gemini-3.8-flash", "messages": []map[string]any{{"role": "user", "content": "hi"}}})
+	_, err := execute(pluginapi.ExecutorRequest{Model: "gemini-3.8-flash", Payload: body, StorageJSON: testCredential(siteWorkBuddyAI)}, sender)
+	var perr *pluginabi.Error
+	if !errors.As(err, &perr) || perr.HTTPStatus != http.StatusBadRequest {
+		t.Fatalf("err = %#v", err)
+	}
+	// CPA's router reads the message: a 400 whose text says the model is not
+	// available for the plan rotates to another credential, any other 400 ends
+	// the request as a client fault. The wording is a routing contract.
+	if !strings.Contains(perr.Message, "not available for your plan") {
+		t.Fatalf("message = %q", perr.Message)
+	}
+}
+
+// TestAMidStreamRefusalClosesWithItsStatus locks the host bridge's error_detail
+// contract: a refusal that ends an already-answered stream has to reach the
+// host's routing with its own status, or the host answers every mid-stream
+// refusal as a statusless 500 and no cooldown or rotation follows.
+func TestAMidStreamRefusalClosesWithItsStatus(t *testing.T) {
+	resetPluginState()
+	previous := firstFrameWindow
+	firstFrameWindow = 40 * time.Millisecond
+	defer func() { firstFrameWindow = previous }()
+	sender := &fakeSender{reply: func(req pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error) {
+		return jsonReply(200, `{"code":0,"data":{"agents":[{"name":"cli","models":["glm-5.3"]}],"models":[{"id":"glm-5.3"}]}}`), nil
+	}}
+	openHTTPStream = func(plan requestPlan, callbackID string) (hostStreamResponse, error) {
+		return hostStreamResponse{StatusCode: 200, Headers: http.Header{"Content-Type": {"text/event-stream"}}, StreamID: "stream-1"}, nil
+	}
+	// Silence first, past the window, so the client is answered before the
+	// refusal shows; then the refusal, as WorkBuddy writes one into an OK stream.
+	reads := 0
+	readStreamChunk = func(id string) (hostReadResponse, error) {
+		reads++
+		if reads <= 2 {
+			time.Sleep(30 * time.Millisecond)
+			return hostReadResponse{}, nil
+		}
+		return hostReadResponse{Payload: []byte("data: {\"code\":11128,\"msg\":\"Illegal API invocation from an unapproved channel\"}\n\n"), Done: true}, nil
+	}
+	emitStreamFrame = func(id string, payload []byte) error { return nil }
+	closed := make(chan *pluginabi.Error, 1)
+	closeHostStreamWith = func(id, message string, err error) {
+		var detail *pluginabi.Error
+		errors.As(err, &detail)
+		closed <- detail
+	}
+	defer func() {
+		openHTTPStream = openUpstreamStream
+		readStreamChunk = readHostStream
+		emitStreamFrame = emitStreamChunk
+		closeHostStreamWith = closeStreamWithError
+	}()
+	body, _ := json.Marshal(map[string]any{"model": "glm-5.3", "messages": []map[string]any{{"role": "user", "content": "hi"}}})
+	out, err := executeStream(pluginapi.ExecutorRequest{Model: "glm-5.3", Payload: body, StorageJSON: testCredential(siteWorkBuddy)}, "cb", "stream-out", sender)
+	if err != nil || out["headers"] == nil {
+		t.Fatalf("out = %v, err = %#v", out, err)
+	}
+	select {
+	case detail := <-closed:
+		if detail == nil {
+			t.Fatal("the stream was closed without an error_detail")
+		}
+		if detail.HTTPStatus != http.StatusForbidden || detail.Code != "forbidden" {
+			t.Fatalf("detail = %d %s", detail.HTTPStatus, detail.Code)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the stream was never closed")
 	}
 }
 
