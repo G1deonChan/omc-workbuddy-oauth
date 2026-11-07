@@ -1,0 +1,449 @@
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"strings"
+	"sync"
+
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
+)
+
+type credentialGate struct {
+	cond   *sync.Cond
+	active int
+}
+
+var gateMu sync.Mutex
+var gates = map[string]*credentialGate{}
+
+// acquire bounds simultaneous requests per credential, as WorkBuddy's plans
+// expect.
+func acquire(id string) func() {
+	gateMu.Lock()
+	g := gates[id]
+	if g == nil {
+		g = &credentialGate{cond: sync.NewCond(&gateMu)}
+		gates[id] = g
+	}
+	for g.active >= getConfig().MaxConcurrency {
+		g.cond.Wait()
+	}
+	g.active++
+	gateMu.Unlock()
+	return func() { gateMu.Lock(); g.active--; g.cond.Broadcast(); gateMu.Unlock() }
+}
+
+type requestPlan struct {
+	HTTP       pluginapi.HTTPRequest
+	Chat       map[string]any
+	Messages   []any
+	Model      workbuddyModel
+	Credential credential
+}
+
+// prepareRequest turns an OpenAI chat completion into a signed WorkBuddy request.
+func prepareRequest(req pluginapi.ExecutorRequest, sender httpSender) (requestPlan, error) {
+	var plan requestPlan
+	c, err := readCredential(req.StorageJSON)
+	if err != nil {
+		return plan, pluginabi.NewError("invalid_auth", "invalid WorkBuddy credential", 401)
+	}
+	spec, ok := configuredSpec(c.Site)
+	if !ok {
+		return plan, pluginabi.NewError("invalid_auth", "invalid WorkBuddy credential", 401)
+	}
+	model := trimModelPrefix(strings.TrimSpace(req.Model))
+	if model == "" {
+		return plan, pluginabi.NewError("invalid_request", "model is required", 400)
+	}
+	chat, err := parseChat(req.Payload)
+	if err != nil {
+		return plan, pluginabi.NewError("invalid_request", err.Error(), 400)
+	}
+	m, ok := findModel(sender, c, spec, model)
+	if !ok {
+		return plan, pluginabi.NewError("unknown_model", fmt.Sprintf("unknown WorkBuddy model %q", model), 400)
+	}
+	normalizeChat(chat, m)
+	// WorkBuddy refuses a chat it cannot stream, so every request is streamed
+	// upstream; a client that asked for one answer gets the stream read out. That
+	// read needs the usage chunk, which WorkBuddy sends only when asked for it.
+	chat["stream"] = true
+	if !req.Stream {
+		options, _ := chat["stream_options"].(map[string]any)
+		if options == nil {
+			options = map[string]any{}
+		}
+		options["include_usage"] = true
+		chat["stream_options"] = options
+	}
+	chat["model"] = m.Key
+	body, err := json.Marshal(chat)
+	if err != nil {
+		return plan, pluginabi.NewError("invalid_request", "invalid chat completion request", 400)
+	}
+	headers := http.Header{}
+	signHeaders(spec, c, headers)
+	chatHeaders(spec, headers)
+	messages, _ := chat["messages"].([]any)
+	attend(headers, messages, sessionOf(req.Headers), c)
+	headers.Set("Content-Type", "application/json")
+	return requestPlan{
+		HTTP:       pluginapi.HTTPRequest{Method: "POST", URL: spec.Endpoint + chatPath, Headers: headers, Body: body},
+		Chat:       chat,
+		Messages:   messages,
+		Model:      m,
+		Credential: c,
+	}, nil
+}
+
+// execute answers one non-streaming chat completion. WorkBuddy always streams, so
+// the buffered body is read as SSE either way.
+func execute(req pluginapi.ExecutorRequest, sender httpSender) (pluginapi.ExecutorResponse, error) {
+	plan, err := prepareRequest(req, sender)
+	if err != nil {
+		return pluginapi.ExecutorResponse{}, err
+	}
+	release := acquire(req.AuthID)
+	defer release()
+	resp, err := sender.Do(plan.HTTP)
+	if err != nil {
+		return pluginapi.ExecutorResponse{}, pluginabi.NewError("transport_error", "WorkBuddy upstream transport failed", 503)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return pluginapi.ExecutorResponse{}, classifyUpstream(plan.Credential, resp.StatusCode, resp.Body)
+	}
+	if !bytes.Contains(resp.Body, []byte("data:")) {
+		// A 200 that is not an event stream is WorkBuddy refusing in JSON.
+		return pluginapi.ExecutorResponse{}, classifyUpstream(plan.Credential, http.StatusBadGateway, resp.Body)
+	}
+	payload, err := aggregateStream(resp.Body, plan.Model.Key)
+	if err != nil {
+		var refusal *streamRefusal
+		if errors.As(err, &refusal) {
+			return pluginapi.ExecutorResponse{}, classifyUpstream(plan.Credential, 0, refusal.Data)
+		}
+		return pluginapi.ExecutorResponse{}, pluginabi.NewError("upstream_error", err.Error(), 502)
+	}
+	return pluginapi.ExecutorResponse{
+		Payload: payload,
+		Headers: http.Header{"Content-Type": {"application/json"}},
+		Metadata: map[string]any{
+			"upstream_host":  plan.Credential.Site,
+			"upstream_model": plan.Model.Key,
+		},
+	}, nil
+}
+
+type hostStreamResponse struct {
+	StatusCode int         `json:"status_code"`
+	Headers    http.Header `json:"headers"`
+	StreamID   string      `json:"stream_id"`
+}
+
+type hostReadResponse struct {
+	Payload []byte `json:"payload"`
+	Error   string `json:"error"`
+	Done    bool   `json:"done"`
+}
+
+func readHostStream(id string) (hostReadResponse, error) {
+	var r hostReadResponse
+	if err := hostRPC("host.http.stream_read", map[string]any{"stream_id": id}, &r); err != nil {
+		return r, errors.New("upstream stream read failed")
+	}
+	if r.Error != "" {
+		return r, errors.New("upstream stream failed")
+	}
+	return r, nil
+}
+
+func closeHostStream(id string) {
+	_ = hostRPC("host.http.stream_close", map[string]any{"stream_id": id}, nil)
+}
+
+func emitStreamChunk(id string, payload []byte) error {
+	return hostRPC("host.stream.emit", map[string]any{"stream_id": id, "payload": payload}, nil)
+}
+
+func closeStream(id, message string) {
+	_ = hostRPC("host.stream.close", map[string]any{"stream_id": id, "error": message}, nil)
+}
+
+// readWholeStream drains and closes a host HTTP stream, with a bound so a
+// misbehaving upstream cannot exhaust memory.
+func readWholeStream(id string) ([]byte, error) {
+	defer closeHostStream(id)
+	var out []byte
+	for {
+		r, err := readHostStream(id)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, r.Payload...)
+		if len(out) > 1<<20 {
+			return nil, errors.New("upstream error body too large")
+		}
+		if r.Done {
+			return out, nil
+		}
+	}
+}
+
+// Streaming seams. Tests replace them to exercise the pump without a plugin host.
+var (
+	readStreamChunk = readHostStream
+	emitStreamFrame = emitStreamChunk
+	openHTTPStream  = openUpstreamStream
+	// pumpFinished is nil in production; a test sets it to learn that a pump has
+	// returned before it puts the seams above back.
+	pumpFinished func(source string)
+)
+
+func openUpstreamStream(plan requestPlan, callbackID string) (hostStreamResponse, error) {
+	var response hostStreamResponse
+	err := hostRPC("host.http.do_stream", map[string]any{"host_callback_id": callbackID, "request": plan.HTTP}, &response)
+	return response, err
+}
+
+// streamPump copies one WorkBuddy event stream into the host stream. WorkBuddy
+// answers in OpenAI chunks, so a frame is forwarded as it came: CPA does the
+// client's protocol translation.
+type streamPump struct {
+	source   string
+	target   string
+	buffer   sseBuffer
+	doneSeen bool
+	emitted  bool
+}
+
+// deliver forwards complete events, and reports false when the client's stream is
+// gone.
+func (p *streamPump) deliver(frames []sseFrame) bool {
+	for _, frame := range frames {
+		if isDone(frame.Data) {
+			p.doneSeen = true
+		}
+		if emitStreamFrame(p.target, frame.Raw) != nil {
+			closeStream(p.target, "client stream closed")
+			return false
+		}
+		p.emitted = true
+	}
+	return true
+}
+
+func (p *streamPump) run() {
+	for {
+		r, err := readStreamChunk(p.source)
+		if err != nil {
+			closeStream(p.target, "WorkBuddy stream failed")
+			return
+		}
+		if !p.deliver(p.buffer.push(r.Payload)) {
+			return
+		}
+		if r.Done {
+			if !p.deliver(p.buffer.flush()) {
+				return
+			}
+			if !p.doneSeen && p.emitted {
+				_ = emitStreamFrame(p.target, []byte("data: [DONE]\n\n"))
+			}
+			closeStream(p.target, "")
+			return
+		}
+	}
+}
+
+// executeStream opens the upstream stream, rejects a refusal before any chunk
+// reaches the client, and then pumps asynchronously.
+func executeStream(req pluginapi.ExecutorRequest, callbackID, streamID string, sender httpSender) (map[string]any, error) {
+	if streamID == "" {
+		return nil, pluginabi.NewError("invalid_request", "stream ID required", 400)
+	}
+	plan, err := prepareRequest(req, sender)
+	if err != nil {
+		return nil, err
+	}
+	release := acquire(req.AuthID)
+	response, err := openHTTPStream(plan, callbackID)
+	if err != nil {
+		release()
+		return nil, pluginabi.NewError("transport_error", "WorkBuddy upstream stream failed", 503)
+	}
+	if response.StreamID == "" {
+		release()
+		return nil, pluginabi.NewError("transport_error", "WorkBuddy upstream stream unavailable", 503)
+	}
+	contentType := strings.ToLower(response.Headers.Get("Content-Type"))
+	if response.StatusCode < 200 || response.StatusCode >= 300 || strings.Contains(contentType, "application/json") {
+		raw, readErr := readWholeStream(response.StreamID)
+		release()
+		if readErr != nil {
+			return nil, pluginabi.NewError("transport_error", "WorkBuddy upstream stream failed", 503)
+		}
+		return nil, classifyUpstream(plan.Credential, response.StatusCode, raw)
+	}
+	// Read until the answer starts so a refusal carried inside an OK stream (a
+	// refused sign-in, an entitlement, an unapproved channel) keeps its real
+	// status instead of arriving as a 200 stream that ends in an error.
+	var pending []sseFrame
+	buffer := sseBuffer{}
+	for attempt := 0; attempt < 8; attempt++ {
+		r, err := readStreamChunk(response.StreamID)
+		if err != nil {
+			closeHostStream(response.StreamID)
+			release()
+			return nil, pluginabi.NewError("transport_error", "WorkBuddy upstream stream failed", 503)
+		}
+		frames := buffer.push(r.Payload)
+		for _, frame := range frames {
+			if err := refusalOf(frame.Data); err != nil {
+				closeHostStream(response.StreamID)
+				release()
+				return nil, classifyUpstream(plan.Credential, refusalStatus(err), frame.Data)
+			}
+		}
+		pending = append(pending, frames...)
+		if len(pending) > 0 {
+			break
+		}
+		if r.Done {
+			pending = append(pending, buffer.flush()...)
+			break
+		}
+	}
+	pump := &streamPump{source: response.StreamID, target: streamID, buffer: buffer}
+	go func() {
+		defer release()
+		defer closeHostStream(pump.source)
+		defer func() {
+			if pumpFinished != nil {
+				pumpFinished(pump.source)
+			}
+		}()
+		if !pump.deliver(pending) {
+			return
+		}
+		pump.run()
+	}()
+	return map[string]any{"headers": http.Header{"Content-Type": {"text/event-stream"}}}, nil
+}
+
+// countTokens is not supported: WorkBuddy documents no token-count endpoint, and
+// a guess would misbill clients that trust it.
+func countTokens() (pluginapi.ExecutorResponse, error) {
+	return pluginapi.ExecutorResponse{}, pluginabi.NewError("not_supported", "WorkBuddy does not provide a verified token-count endpoint", http.StatusNotImplemented)
+}
+
+// upstreamMessage reads WorkBuddy's refusal text from either shape it sends: its
+// own {code, msg} envelope, or an OpenAI-style {error: {message}}.
+func upstreamMessage(status int, body []byte) (code, message string) {
+	env, _ := parseEnvelope(body)
+	code = env.code()
+	message = env.message()
+	if message != "" {
+		return code, message
+	}
+	var openai struct {
+		Error *struct {
+			Message string `json:"message"`
+			Code    any    `json:"code"`
+			Type    string `json:"type"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(body, &openai) == nil && openai.Error != nil {
+		if strings.TrimSpace(openai.Error.Message) != "" {
+			message = strings.TrimSpace(openai.Error.Message)
+		}
+		switch v := openai.Error.Code.(type) {
+		case string:
+			code = v
+		case float64:
+			code = fmt.Sprintf("%.0f", v)
+		}
+		if code == "" {
+			code = openai.Error.Type
+		}
+		return code, message
+	}
+	text := strings.TrimSpace(string(body))
+	if len(text) > 400 {
+		text = text[:400]
+	}
+	return "", text
+}
+
+// classifyUpstream maps a WorkBuddy refusal onto the status the client should see.
+// A lapsed sign-in must read as one so CPA can ask for a new one; a frequency
+// limit keeps 429 and its message, which names when the allowance resets.
+func classifyUpstream(c credential, status int, body []byte) error {
+	site, ok := siteFor(c.Site)
+	if !ok {
+		site = siteSpec{Name: "WorkBuddy"}
+	}
+	code, message := upstreamMessage(status, body)
+	if message == "" {
+		message = http.StatusText(status)
+	}
+	if code != "" {
+		switch code {
+		case "10085":
+			message = "WorkBuddy refused this client's identity (10085): " + message
+		case "11128":
+			message = "WorkBuddy refused an agent identity line in this prompt (11128): " + message
+		}
+	}
+	// The codes are more specific than the status: a refusal carried inside an OK
+	// stream has no status at all, and an unapproved-channel refusal is 403
+	// whatever the transport said.
+	effective := status
+	switch code {
+	case "11128", "11153", "11158":
+		effective = http.StatusForbidden
+	case "14018":
+		effective = http.StatusTooManyRequests
+	case "10085":
+		effective = http.StatusBadRequest
+	}
+	if effective == 0 {
+		effective = http.StatusBadGateway
+	}
+	switch {
+	case effective == http.StatusUnauthorized:
+		return pluginabi.NewError("reauth_required", site.Name+" sign-in has expired; sign in again", http.StatusUnauthorized)
+	case effective == http.StatusPaymentRequired:
+		return pluginabi.NewError("payment_required", site.Name+": credits are spent: "+message, effective)
+	case effective == http.StatusForbidden:
+		return pluginabi.NewError("forbidden", site.Name+": "+message, effective)
+	case effective == http.StatusTooManyRequests:
+		return pluginabi.NewError("rate_limited", site.Name+" is limiting this account: "+message, effective)
+	case effective >= 500:
+		return pluginabi.NewError("upstream_error", site.Name+" upstream failed: "+message, http.StatusBadGateway)
+	case effective == http.StatusNotFound:
+		return pluginabi.NewError("not_found", site.Name+": "+message, effective)
+	case effective >= 300 && effective < 500:
+		if strings.Contains(strings.ToLower(message), "prompt is too long") {
+			message = "the prompt is longer than this model takes: " + message
+		}
+		return pluginabi.NewError("invalid_request", site.Name+": "+message, effective)
+	default:
+		return pluginabi.NewError("upstream_error", site.Name+": "+message, http.StatusBadGateway)
+	}
+}
+
+// refusalStatus is the status a refusal inside a stream stands for: its own when
+// it answered with one, else none, so the code decides.
+func refusalStatus(err error) int {
+	var refusal *wbError
+	if errors.As(err, &refusal) {
+		return refusal.Status
+	}
+	return 0
+}
