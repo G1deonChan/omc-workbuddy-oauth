@@ -16,3 +16,4 @@ secrets/
 .workbuddy-oauth-state.key
 __pycache__/
 .pi/
+go/omc-workbuddy-oauth
