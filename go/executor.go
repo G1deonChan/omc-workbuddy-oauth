@@ -473,16 +473,16 @@ func classifyUpstream(c credential, status int, body []byte) error {
 	}
 	// A plan that does not include a model says nothing about the request: the
 	// model is hidden from this account's list, and the credential stays healthy.
-	// The message says the model is not available for the plan, the wording CPA's
-	// router reads as a credential-model mismatch rather than a request fault, so
-	// the request falls through to another credential or provider.
+	// The code is the contract, not the words: CPA reads "unknown_model" as this
+	// credential not having the model, so the request falls through to another
+	// credential or provider. A code it does not know would end the request.
 	if model, plan, ok := refusedModel(message); ok {
 		denyModel(c, model, plan)
 		who := ""
 		if plan != "" {
 			who = " (" + plan + ")"
 		}
-		return pluginabi.NewError("model_not_allowed",
+		return pluginabi.NewError("unknown_model",
 			fmt.Sprintf("%s: %s is not available for your plan%s; the model is hidden from this credential's list", site.Name, model, who),
 			http.StatusBadRequest)
 	}

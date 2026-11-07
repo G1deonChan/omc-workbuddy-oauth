@@ -697,7 +697,7 @@ func TestAModelThePlanRefusesIsHiddenAndNotRetried(t *testing.T) {
 	storage := testCredential(siteWorkBuddyAI)
 	_, err := execute(pluginapi.ExecutorRequest{Model: "gpt-6.1-sol", Payload: body, StorageJSON: storage}, sender)
 	var perr *pluginabi.Error
-	if !errors.As(err, &perr) || perr.HTTPStatus != http.StatusBadRequest || perr.Code != "model_not_allowed" {
+	if !errors.As(err, &perr) || perr.HTTPStatus != http.StatusBadRequest || perr.Code != "unknown_model" {
 		t.Fatalf("err = %#v", err)
 	}
 	if !strings.Contains(perr.Message, "gpt-6.1-sol") || !strings.Contains(perr.Message, "personal_free_user") {
@@ -723,7 +723,7 @@ func TestAModelThePlanRefusesIsHiddenAndNotRetried(t *testing.T) {
 	}
 }
 
-func TestAPlanRefusalIsWordedForTheRoutersFallback(t *testing.T) {
+func TestAPlanRefusalUsesTheModelSupportCode(t *testing.T) {
 	resetPluginState()
 	sender := &fakeSender{reply: func(req pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error) {
 		switch {
@@ -739,9 +739,12 @@ func TestAPlanRefusalIsWordedForTheRoutersFallback(t *testing.T) {
 	if !errors.As(err, &perr) || perr.HTTPStatus != http.StatusBadRequest {
 		t.Fatalf("err = %#v", err)
 	}
-	// CPA's router reads the message: a 400 whose text says the model is not
-	// available for the plan rotates to another credential, any other 400 ends
-	// the request as a client fault. The wording is a routing contract.
+	// The code is the routing contract: CPA reads "unknown_model" as this
+	// credential not having the model and asks another provider of it, whatever
+	// the message says. The message is for the person reading it.
+	if perr.Code != "unknown_model" {
+		t.Fatalf("code = %q", perr.Code)
+	}
 	if !strings.Contains(perr.Message, "not available for your plan") {
 		t.Fatalf("message = %q", perr.Message)
 	}
