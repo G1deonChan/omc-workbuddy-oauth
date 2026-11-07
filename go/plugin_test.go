@@ -656,6 +656,94 @@ func TestACanceledRequestIsTheCallersNotTheCredentials(t *testing.T) {
 	}
 }
 
+func TestExecuteStreamAnswersBeforeAThinkingModel(t *testing.T) {
+	resetPluginState()
+	previous := firstFrameWindow
+	firstFrameWindow = 40 * time.Millisecond
+	defer func() { firstFrameWindow = previous }()
+	sender := &fakeSender{reply: func(req pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error) {
+		return jsonReply(200, `{"code":0,"data":{"agents":[{"name":"cli","models":["glm-5.3"]}],"models":[{"id":"glm-5.3"}]}}`), nil
+	}}
+	think := make(chan struct{})
+	first := true
+	openHTTPStream = func(plan requestPlan, callbackID string) (hostStreamResponse, error) {
+		return hostStreamResponse{StatusCode: 200, Headers: http.Header{"Content-Type": {"text/event-stream"}}, StreamID: "stream-1"}, nil
+	}
+	readStreamChunk = func(string) (hostReadResponse, error) {
+		<-think
+		if first {
+			first = false
+			return hostReadResponse{Payload: []byte("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"late\"}}]}\n\n"), Done: true}, nil
+		}
+		return hostReadResponse{Done: true}, nil
+	}
+	emitted := make(chan string, 4)
+	emitStreamFrame = func(_ string, payload []byte) error { emitted <- string(payload); return nil }
+	finished := make(chan struct{})
+	pumpFinished = func(string) { close(finished) }
+	defer func() {
+		openHTTPStream = openUpstreamStream
+		readStreamChunk = readHostStream
+		emitStreamFrame = emitStreamChunk
+		pumpFinished = nil
+	}()
+	body, _ := json.Marshal(map[string]any{"model": "glm-5.3", "messages": []map[string]any{{"role": "user", "content": "hi"}}})
+	at := time.Now()
+	if _, err := executeStream(pluginapi.ExecutorRequest{Model: "glm-5.3", Payload: body, StorageJSON: testCredential(siteWorkBuddy)}, "cb", "stream-out", sender); err != nil {
+		t.Fatal(err)
+	}
+	if waited := time.Since(at); waited > firstFrameWindow*5 {
+		t.Fatalf("the client was held %v while the model thought", waited)
+	}
+	close(think)
+	select {
+	case <-finished:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the stream never finished")
+	}
+	select {
+	case frame := <-emitted:
+		if !strings.Contains(frame, "late") {
+			t.Fatalf("frame = %q", frame)
+		}
+	default:
+		t.Fatal("the late frame was never delivered")
+	}
+}
+
+func TestExecuteStreamReportsACanceledCaller(t *testing.T) {
+	resetPluginState()
+	sender := &fakeSender{reply: func(req pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error) {
+		return jsonReply(200, `{"code":0,"data":{"agents":[{"name":"cli","models":["glm-5.3"]}],"models":[{"id":"glm-5.3"}]}}`), nil
+	}}
+	openHTTPStream = func(plan requestPlan, callbackID string) (hostStreamResponse, error) {
+		return hostStreamResponse{StatusCode: 200, Headers: http.Header{"Content-Type": {"text/event-stream"}}, StreamID: "stream-1"}, nil
+	}
+	readStreamChunk = func(string) (hostReadResponse, error) {
+		return hostReadResponse{}, &transportError{cause: "context canceled"}
+	}
+	emitStreamFrame = func(string, []byte) error { return nil }
+	finished := make(chan struct{})
+	pumpFinished = func(string) { close(finished) }
+	defer func() {
+		openHTTPStream = openUpstreamStream
+		readStreamChunk = readHostStream
+		emitStreamFrame = emitStreamChunk
+		pumpFinished = nil
+	}()
+	body, _ := json.Marshal(map[string]any{"model": "glm-5.3", "messages": []map[string]any{{"role": "user", "content": "hi"}}})
+	_, err := executeStream(pluginapi.ExecutorRequest{Model: "glm-5.3", Payload: body, StorageJSON: testCredential(siteWorkBuddy)}, "cb", "stream-out", sender)
+	var perr *pluginabi.Error
+	if !errors.As(err, &perr) || perr.HTTPStatus != 499 || perr.Code != "client_closed" {
+		t.Fatalf("err = %#v", err)
+	}
+	select {
+	case <-finished:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the pump never returned")
+	}
+}
+
 func TestCountTokensIsNotInvented(t *testing.T) {
 	_, err := countTokens()
 	var perr *pluginabi.Error

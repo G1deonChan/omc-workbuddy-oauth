@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
@@ -215,11 +216,57 @@ func openUpstreamStream(plan requestPlan, callbackID string) (hostStreamResponse
 // answers in OpenAI chunks, so a frame is forwarded as it came: CPA does the
 // client's protocol translation.
 type streamPump struct {
-	source   string
-	target   string
-	buffer   sseBuffer
-	doneSeen bool
-	emitted  bool
+	source     string
+	target     string
+	buffer     sseBuffer
+	credential credential
+	doneSeen   bool
+	emitted    bool
+}
+
+// pumpStart is what the pump found before the client was answered: the stream's
+// first events, or the refusal that ended it.
+type pumpStart struct {
+	frames []sseFrame
+	err    error
+}
+
+// firstFrameWindow is how long a streaming request waits for WorkBuddy's first
+// event before it answers the client. WorkBuddy sends nothing while a reasoning
+// model thinks, so waiting for the first event before replying held the client's
+// headers — and every byte — for as long as the model thought; a caller, or a
+// proxy along the way, then gave up. That is the HTTP 499 with "context canceled"
+// a live streaming deepseek-v4.1-flash-sg request showed. Two seconds still
+// catches a refusal WorkBuddy writes as the stream's first event.
+var firstFrameWindow = 2 * time.Second
+
+// first reads until the stream's first events arrive, tells the caller what it
+// found, and returns it. A refusal in those first bytes keeps its real status.
+func (p *streamPump) first(ready chan<- pumpStart) pumpStart {
+	var frames []sseFrame
+	for attempt := 0; attempt < 8 && len(frames) == 0; attempt++ {
+		r, err := readStreamChunk(p.source)
+		if err != nil {
+			start := pumpStart{err: transportFailure(err)}
+			ready <- start
+			return start
+		}
+		frames = append(frames, p.buffer.push(r.Payload)...)
+		if r.Done {
+			frames = append(frames, p.buffer.flush()...)
+			break
+		}
+	}
+	for _, frame := range frames {
+		if err := refusalOf(frame.Data); err != nil {
+			start := pumpStart{err: classifyUpstream(p.credential, refusalStatus(err), frame.Data)}
+			ready <- start
+			return start
+		}
+	}
+	start := pumpStart{frames: frames}
+	ready <- start
+	return start
 }
 
 // deliver forwards complete events, and reports false when the client's stream is
@@ -290,36 +337,13 @@ func executeStream(req pluginapi.ExecutorRequest, callbackID, streamID string, s
 		}
 		return nil, classifyUpstream(plan.Credential, response.StatusCode, raw)
 	}
-	// Read until the answer starts so a refusal carried inside an OK stream (a
-	// refused sign-in, an entitlement, an unapproved channel) keeps its real
-	// status instead of arriving as a 200 stream that ends in an error.
-	var pending []sseFrame
-	buffer := sseBuffer{}
-	for attempt := 0; attempt < 8; attempt++ {
-		r, err := readStreamChunk(response.StreamID)
-		if err != nil {
-			closeHostStream(response.StreamID)
-			release()
-			return nil, transportFailure(err)
-		}
-		frames := buffer.push(r.Payload)
-		for _, frame := range frames {
-			if err := refusalOf(frame.Data); err != nil {
-				closeHostStream(response.StreamID)
-				release()
-				return nil, classifyUpstream(plan.Credential, refusalStatus(err), frame.Data)
-			}
-		}
-		pending = append(pending, frames...)
-		if len(pending) > 0 {
-			break
-		}
-		if r.Done {
-			pending = append(pending, buffer.flush()...)
-			break
-		}
-	}
-	pump := &streamPump{source: response.StreamID, target: streamID, buffer: buffer}
+	// Answer the client as soon as the stream is open. Reading until the answer
+	// starts would keep the client waiting through a reasoning model's thinking,
+	// and a refusal WorkBuddy writes as the stream's first event is still caught
+	// inside firstFrameWindow.
+	pump := &streamPump{source: response.StreamID, target: streamID, credential: plan.Credential}
+	started := make(chan bool, 1)
+	ready := make(chan pumpStart, 1)
 	go func() {
 		defer release()
 		defer closeHostStream(pump.source)
@@ -328,11 +352,31 @@ func executeStream(req pluginapi.ExecutorRequest, callbackID, streamID string, s
 				pumpFinished(pump.source)
 			}
 		}()
-		if !pump.deliver(pending) {
+		start := pump.first(ready)
+		answered := <-started
+		if start.err != nil {
+			if answered {
+				// The client has the stream; end it with the refusal instead of
+				// leaving it open.
+				closeStream(pump.target, start.err.Error())
+			}
+			return
+		}
+		if !pump.deliver(start.frames) {
 			return
 		}
 		pump.run()
 	}()
+	select {
+	case start := <-ready:
+		if start.err != nil {
+			started <- false
+			return nil, start.err
+		}
+		started <- true
+	case <-time.After(firstFrameWindow):
+		started <- true
+	}
 	return map[string]any{"headers": http.Header{"Content-Type": {"text/event-stream"}}}, nil
 }
 
