@@ -372,6 +372,9 @@ Other behaviour worth knowing:
   caller went away, `504` when the host's time limit ran out, `503` otherwise. CPA
   reads `499` as the client's own cancellation and does not rest the credential for
   it, so a caller's short timeout never turns into a credential warning.
+- A streaming request is answered as soon as WorkBuddy's stream opens: the plugin
+  spends at most two seconds looking for a refusal in the stream's first event, so a
+  reasoning model's thinking is never spent before the client's headers go out.
 - The plugin does not retry a refusal in place. It answers with the mapped status so
   CPA can decide whether another credential should carry the request.
 - A refusal that arrives inside an `OK` stream keeps its real status: streaming
@@ -411,12 +414,14 @@ Other behaviour worth knowing:
   the meantime.
 - **`499` with `context canceled`:** the caller stopped waiting, not WorkBuddy. The
   plugin reports it as `499` / `client_closed`, and CPA does not count it against the
-  credential. A **non-streaming** request is the usual cause: WorkBuddy only streams,
-  so the plugin has to hold the whole answer — thinking included — before it can
-  return one completion, and a caller with a 30–60s timeout gives up first. Ask for a
-  stream, or give the caller a longer timeout. `deepseek-v4.1-flash-sg` amplifies it:
-  it is reasoning-only with `defaultEffort` `high`, so a prompt it thinks hard about
-  takes that much longer to its first token.
+  credential. Up to 0.1.2 a **streaming** request could earn this on its own: the
+  plugin read until the stream's first answer event before it answered the client, and
+  a reasoning model that thinks for a minute sent nothing at all in that time, so the
+  caller — or a proxy in between — gave up on headers that never came.
+  `deepseek-v4.1-flash-sg` is reasoning-only with `defaultEffort` `high`, which makes
+  that window the worst it gets. From 0.1.3 the stream is handed to the client as soon
+  as it is open, so an upgrade is the first thing to try. If it still happens, the
+  caller's own timeout is the cause: read the stream with a longer one.
 - **`504` with `upstream_timeout`:** the host's own limit ran out before WorkBuddy
   answered; raise CPA's timeout for the route, or stream it.
 - **`403` on a model that is listed:** the account is not entitled to that model
