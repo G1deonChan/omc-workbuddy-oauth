@@ -84,11 +84,27 @@ func quotaReset() pluginapi.QuotaResetResponse {
 	return pluginapi.QuotaResetResponse{Success: false, Message: "WorkBuddy credits reset on WorkBuddy's own usage page"}
 }
 
-// meters is the request shape both billing paths share.
-func meter(sender httpSender, spec siteSpec, c credential, path string) (json.RawMessage, error) {
+// meter is the request shape every billing path shares: one POST of the body the
+// meter expects, signed as WorkBuddy's own client signs it.
+func meter(sender httpSender, spec siteSpec, c credential, path string, body any) (json.RawMessage, error) {
 	headers := http.Header{}
 	signHeaders(spec, c, headers)
-	return wbCall(sender, "POST", spec.Endpoint+path, headers, map[string]any{})
+	if body == nil {
+		body = map[string]any{}
+	}
+	return wbCall(sender, "POST", spec.Endpoint+path, headers, body)
+}
+
+// meterPage reads one billing meter, trying the versioned path when a build
+// serves it only there. WorkBuddy's two deployments are not the same history:
+// the China one has answered some meters under /v2 alone, and only a 404 is
+// evidence of that, so every other failure is returned as it came.
+func meterPage(sender httpSender, spec siteSpec, c credential, path string, body any) (json.RawMessage, error) {
+	raw, err := meter(sender, spec, c, path, body)
+	if err == nil || statusOf(err) != http.StatusNotFound {
+		return raw, err
+	}
+	return meter(sender, spec, c, "/v2"+path, body)
 }
 
 // quotaFetch reads the account's credits and normalizes them.
@@ -106,7 +122,7 @@ func quotaFetch(req pluginapi.QuotaFetchRequest, sender httpSender) (pluginapi.Q
 	// token on every use, and this call has no way to save the new one back, so a
 	// renewal here would spend a token the stored credential can no longer use.
 	// The host renews on its own schedule and persists what it gets.
-	raw, err := meter(sender, spec, c, summaryPath)
+	raw, err := meter(sender, spec, c, summaryPath, nil)
 	if err != nil {
 		if statusOf(err) == http.StatusUnauthorized || statusOf(err) == http.StatusForbidden {
 			return out, pluginabiError("invalid_auth", spec.Name+" sign-in has expired; sign in again", 401)
@@ -117,8 +133,21 @@ func quotaFetch(req pluginapi.QuotaFetchRequest, sender httpSender) (pluginapi.Q
 	if err != nil {
 		return out, pluginabiError("usage_error", err.Error(), http.StatusBadGateway)
 	}
-	windows := summaryWindows(summary)
-	if strings.TrimSpace(c.EnterpriseID) != "" {
+	// The summary states amounts, never a cycle: its packages carry no start or
+	// end time. The reset therefore comes from the package meter, and a package
+	// list that cannot be read leaves the amounts standing without one rather
+	// than failing a reading that did succeed. A team account is the exception:
+	// its credits are the enterprise meter's, which states its own cycle.
+	isEnterprise := strings.TrimSpace(c.EnterpriseID) != ""
+	now := time.Now()
+	reset := summaryReset(summary)
+	if !isEnterprise {
+		if packages, err := readPackages(sender, spec, c, now); err == nil {
+			reset = packageReset(summary, packages, now)
+		}
+	}
+	windows := summaryWindows(summary, reset)
+	if isEnterprise {
 		if credit, err := readEnterpriseUsage(sender, spec, c); err == nil {
 			if w, ok := enterpriseWindows(credit); ok {
 				windows = []quotaWindow{w}
@@ -179,7 +208,9 @@ type quotaWindow struct {
 // the plan's base credits, every other kind beside them, and — when both exist —
 // the account's whole, which is what stops it. A summary that names no groups is
 // split by package code, keeping the plan's own packages apart from the rest.
-func summaryWindows(summary resourceSummary) []quotaWindow {
+// reset is when the plan's credits come back, carried by the plan's window and by
+// the account's whole; it is empty when WorkBuddy does not state one.
+func summaryWindows(summary resourceSummary, reset string) []quotaWindow {
 	planTotal, planUsed := 0.0, 0.0
 	extraTotal, extraUsed := 0.0, 0.0
 	prepaid := 0.0
@@ -230,7 +261,6 @@ func summaryWindows(summary resourceSummary) []quotaWindow {
 		used, _ := capacity(p.CycleUsedCapacity)
 		extraUsed += used
 	}
-	reset := summaryReset(summary)
 	var out []quotaWindow
 	switch {
 	case planTotal > 0 && extraTotal > 0:
@@ -269,11 +299,14 @@ func planName(c credential, summary resourceSummary) string {
 	return "Free plan"
 }
 
-// summaryReset is when the plan's credits come back: the subscription package's
-// cycle end, else the daily slice's. WorkBuddy states both in UTC+8.
+// summaryReset is when the plan's credits come back, read from the summary's own
+// packages: the subscription package's cycle end, else the daily slice's. It is
+// the fallback for a summary that states a cycle at all — WorkBuddy's current
+// summary states none, which is what readPackages exists for — and it follows the
+// same rule as packageReset, so the two cannot disagree about which package is
+// the plan's.
 func summaryReset(summary resourceSummary) string {
 	subscription := strings.TrimSpace(summary.SubscriptionPackageCode)
-	best := ""
 	for _, p := range summary.Packages {
 		at := beijingTime(p.CycleEndTime)
 		if at == "" {
@@ -288,12 +321,13 @@ func summaryReset(summary resourceSummary) string {
 		if strings.TrimSpace(asString(p.CapacityType)) == "4" {
 			return at
 		}
-		if best == "" || at < best {
-			best = at
-		}
 	}
-	return best
+	return ""
 }
+
+// beijingZone is WorkBuddy's own clock: its cycle and grant timestamps are wall
+// clock in UTC+8, never UTC and never the host's zone.
+var beijingZone = time.FixedZone("UTC+8", 8*3600)
 
 // beijingTime reads WorkBuddy's own timestamps ("2026-10-13 00:39:27", UTC+8) as
 // RFC 3339 in UTC.
@@ -302,7 +336,7 @@ func beijingTime(value string) string {
 	if s == "" {
 		return ""
 	}
-	at, err := time.ParseInLocation("2006-01-02 15:04:05", s, time.FixedZone("UTC+8", 8*3600))
+	at, err := time.ParseInLocation("2006-01-02 15:04:05", s, beijingZone)
 	if err != nil {
 		if parsed, err := time.Parse(time.RFC3339, s); err == nil {
 			return parsed.UTC().Format(time.RFC3339)
@@ -312,10 +346,139 @@ func beijingTime(value string) string {
 	return at.UTC().Format(time.RFC3339)
 }
 
+// beijingWall writes an instant the way WorkBuddy's own clock reads it, which is
+// the shape every package range and cycle in its billing API takes.
+func beijingWall(at time.Time) string {
+	return at.In(beijingZone).Format("2006-01-02 15:04:05")
+}
+
+// packageRecord is one package as the package meter lists it. The resource
+// summary counts packages but states no cycle, so this list is the only place a
+// package's cycle end — and with it the plan's reset — can be read. A grant's own
+// lapse is a different question: DeductionEndTime says when credits are lost,
+// CycleEndTime when the cycle refills, and the card asks the second.
+type packageRecord struct {
+	PackageCode  string          `json:"PackageCode"`
+	CapacityType json.RawMessage `json:"CapacityType"`
+	CycleEndTime string          `json:"CycleEndTime"`
+}
+
+// packageList is the package meter's answer: WorkBuddy wraps one page twice, and
+// the count is what says whether a later page is worth asking for.
+type packageList struct {
+	Response struct {
+		Data struct {
+			TotalCount json.RawMessage `json:"TotalCount"`
+			Accounts   []packageRecord `json:"Accounts"`
+		} `json:"Data"`
+	} `json:"Response"`
+}
+
+// packagePageSize and packagePages bound the walk: an account with more than a
+// thousand packages is not a reading worth waiting on.
+const (
+	packagePageSize = 200
+	packagePages    = 5
+)
+
+// readPackages lists the account's packages. The range begins now and reaches ten
+// years on, which is what keeps already-ended packages out: their cycle says
+// nothing about when the plan refills.
+func readPackages(sender httpSender, spec siteSpec, c credential, now time.Time) ([]packageRecord, error) {
+	var out []packageRecord
+	for page := 1; page <= packagePages; page++ {
+		body := map[string]any{
+			"PageNumber":               page,
+			"PageSize":                 packagePageSize,
+			"ProductCode":              "p_tcaca",
+			"Status":                   []int{0, 3},
+			"PackageEndTimeRangeBegin": beijingWall(now),
+			"PackageEndTimeRangeEnd":   beijingWall(now.AddDate(10, 0, 0)),
+		}
+		raw, err := meterPage(sender, spec, c, packagesPath, body)
+		if err != nil {
+			return nil, err
+		}
+		var list packageList
+		if json.Unmarshal(raw, &list) != nil {
+			return nil, errors.New("WorkBuddy returned an invalid package list")
+		}
+		got := list.Response.Data.Accounts
+		out = append(out, got...)
+		// The stated count decides the walk, not the length of one page: an
+		// upstream that serves fewer rows than asked for still has more to give.
+		total, stated := capacity(list.Response.Data.TotalCount)
+		switch {
+		case len(got) == 0:
+			return out, nil
+		case stated && total > 0:
+			if float64(len(out)) >= total {
+				return out, nil
+			}
+		case len(got) < packagePageSize:
+			return out, nil
+		}
+	}
+	return out, nil
+}
+
+// packageReset is when the plan's credits come back, read the way WorkBuddy's own
+// client reads it: the cycle end of the package the summary names as the
+// subscription, or — for an account whose summary names none, which is every free
+// account — the cycle end of its CapacityType 4 slice. A cycle that is missing,
+// unlisted or already over leaves the reset unknown rather than claiming one.
+func packageReset(summary resourceSummary, packages []packageRecord, now time.Time) string {
+	if subscription := strings.TrimSpace(summary.SubscriptionPackageCode); subscription != "" {
+		for _, p := range packages {
+			if p.PackageCode == subscription {
+				return rfc3339(futureCycleEnd(p.CycleEndTime, now))
+			}
+		}
+		return ""
+	}
+	// A build that lists more than one slice names the plan's own credits, and a
+	// slice's cycles all refill together; if two ever differ, the last one to end is
+	// when the plan's pool is whole again, so the card does not count down to a
+	// refill that leaves it still short.
+	var latest time.Time
+	for _, p := range packages {
+		if strings.TrimSpace(asString(p.CapacityType)) != "4" {
+			continue
+		}
+		if end := futureCycleEnd(p.CycleEndTime, now); end.After(latest) {
+			latest = end
+		}
+	}
+	return rfc3339(latest)
+}
+
+// futureCycleEnd is a package's cycle end when it is still to come, and the zero
+// time when it is missing, unreadable or already over.
+func futureCycleEnd(value string, now time.Time) time.Time {
+	at := beijingTime(value)
+	if at == "" {
+		return time.Time{}
+	}
+	instant, err := time.Parse(time.RFC3339, at)
+	if err != nil || !instant.After(now) {
+		return time.Time{}
+	}
+	return instant
+}
+
+// rfc3339 writes an instant in the form a quota bucket carries, and nothing when
+// there is no instant to write.
+func rfc3339(at time.Time) string {
+	if at.IsZero() {
+		return ""
+	}
+	return at.UTC().Format(time.RFC3339)
+}
+
 // readEnterpriseUsage reads the meter a team account's usage page uses.
 func readEnterpriseUsage(sender httpSender, spec siteSpec, c credential) (enterpriseUsage, error) {
 	var usage enterpriseUsage
-	raw, err := meter(sender, spec, c, enterpriseUsagePath)
+	raw, err := meter(sender, spec, c, enterpriseUsagePath, nil)
 	if err != nil {
 		return usage, err
 	}

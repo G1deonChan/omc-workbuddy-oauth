@@ -26,8 +26,9 @@ sources:
   fields that describe them, and the per-build differences (WorkBuddy AI's text-only
   GLM models, the China build's Messages-only Claude models).
 - **Billing**: `/billing/meter/get-user-resource-summary` and its credit groups and
-  packages, `/billing/meter/get-enterprise-user-usage` for a team account, and the
-  UTC+8 cycle timestamps both send.
+  packages, `/billing/meter/get-user-resource` for the packages' cycles,
+  `/billing/meter/get-enterprise-user-usage` for a team account, and the UTC+8
+  timestamps each sends.
 
 WorkBuddy, CodeBuddy and their marks belong to their owner. This project is not
 affiliated with or endorsed by them.

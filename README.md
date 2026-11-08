@@ -99,7 +99,7 @@ not available: the plugin runs inside CPA on a server and reads no client files.
   one user send stays one request in the account's usage detail.
 - Normalized quota from the billing meter, split the way WorkBuddy's own panel
   splits it: the plan's credits, extra credits, the account's total, and any prepaid
-  balance.
+  balance, with the plan's reset read from the package meter beside that summary.
 - Plan-aware model listing: a model WorkBuddy refuses as not included in the
   account's plan is hidden from that credential for an hour instead of being offered
   and refused again.

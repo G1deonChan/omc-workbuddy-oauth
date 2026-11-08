@@ -331,8 +331,10 @@ POST /v8/management/plugins/omc-workbuddy-oauth/quota
 
 `GET` describes the provider: `workbuddy`, display name `WorkBuddy`, reset not
 supported. `POST` fetches one credential's credits from
-`POST /billing/meter/get-user-resource-summary`, renewing a token that is about to
-end and retrying once on a `401`.
+`POST /billing/meter/get-user-resource-summary` and the plan's cycle from
+`POST /billing/meter/get-user-resource` beside it. Neither call renews the
+credential: WorkBuddy rotates the refresh token on every use and a quota read has
+nowhere to save the new one, so the host renews on its own schedule.
 
 The response is normalized into a subscription and one group of buckets:
 
@@ -347,7 +349,13 @@ The response is normalized into a subscription and one group of buckets:
 - `Prepaid credits` appears when a package has credits left but no total: it is a
   balance, so its description carries the amount.
 - Each bucket reports the remaining fraction and a `N / M credits left` description.
-  Resets come from the package's cycle end, which WorkBuddy states in UTC+8.
+  The plan's window and the account's total also carry a reset: the cycle end of the
+  package the summary names as the subscription, or — for an account whose summary
+  names none, which is every free account — of its `CapacityType 4` slice. The
+  summary states amounts only, so the cycle is read from the package meter, and both
+  clocks are UTC+8. A cycle already over, a package the list does not carry, or a
+  package meter that cannot be read leaves the reset out rather than guessing one,
+  because the amounts are still a true reading.
 - A team account is read from `/billing/meter/get-enterprise-user-usage`, the meter
   WorkBuddy's own usage page uses, because its resource summary answers with no
   packages.

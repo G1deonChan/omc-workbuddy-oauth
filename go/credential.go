@@ -194,6 +194,11 @@ const modelsPath = "/v3/config"
 // /v2 prefix, unlike the chat and the plugin API.
 const summaryPath = "/billing/meter/get-user-resource-summary"
 
+// packagesPath is the billing meter that lists the account's packages with their
+// cycles and grant ends. The resource summary counts packages but states no start
+// or end time, so this is where a plan's reset is read from.
+const packagesPath = "/billing/meter/get-user-resource"
+
 // enterpriseUsagePath is the meter WorkBuddy's own usage page reads for a team
 // account, whose resource summary answers with no packages at all.
 const enterpriseUsagePath = "/billing/meter/get-enterprise-user-usage"
