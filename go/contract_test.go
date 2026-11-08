@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"os"
+	"reflect"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
@@ -124,6 +125,81 @@ func TestParseAuthReadsPersistedFile(t *testing.T) {
 	}
 	if resp.Auth.ID != "workbuddy-x.json" || resp.Auth.FileName != "workbuddy-x.json" {
 		t.Fatalf("identity = %q %q", resp.Auth.ID, resp.Auth.FileName)
+	}
+}
+
+// The management API writes fields such as note next to the credential, and CPA
+// rebuilds the runtime auth from parseAuth's metadata on every reload. A parser
+// that republishes identity keys alone makes those writes read back as
+// unpersisted (the console reports "CPA did not persist note").
+func TestParseAuthPreservesManagementFields(t *testing.T) {
+	persisted := map[string]any{
+		"type":            "workbuddy",
+		"site":            siteWorkBuddyAI,
+		"access":          "at",
+		"refresh":         "rt",
+		"expires":         1900000000000,
+		"uid":             "u-1",
+		"name":            "Ada",
+		"enterprise_id":   "ent-1",
+		"enterprise_name": "Acme",
+		"email":           "dev@example.test",
+		"oauth_provider":  "stale-entry",
+		"note":            "work account",
+		"prefix":          "w",
+		"priority":        7,
+		"weight":          3,
+		"proxy_url":       "http://proxy.test:8080",
+		"disable_cooling": true,
+		"websockets":      false,
+		"using_api":       true,
+		"expired":         "2030-01-01T00:00:00Z",
+		"request_retry":   2,
+		"headers":         map[string]any{"X-Test": "1"},
+		"excluded_models": []any{"m1"},
+		"model_aliases":   []any{map[string]any{"name": "m", "alias": "a"}},
+	}
+	body, err := json.Marshal(persisted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var want map[string]any
+	if err := json.Unmarshal(body, &want); err != nil {
+		t.Fatal(err)
+	}
+	credentialKeys := map[string]bool{"site": true, "access": true, "refresh": true, "expires": true, "uid": true, "name": true, "enterprise_id": true, "enterprise_name": true}
+	resp := parseAuth(pluginapi.AuthParseRequest{Provider: siteWorkBuddyAI, FileName: "workbuddy-x.json", RawJSON: body})
+	if !resp.Handled {
+		t.Fatal("credential not recognized")
+	}
+	for key, expected := range want {
+		switch key {
+		case "type", "email", "oauth_provider":
+			continue
+		}
+		if credentialKeys[key] {
+			continue
+		}
+		if got := resp.Auth.Metadata[key]; !reflect.DeepEqual(got, expected) {
+			t.Fatalf("metadata[%q] = %#v, want %#v", key, got, expected)
+		}
+	}
+	if got := resp.Auth.Metadata["type"]; got != credentialProvider {
+		t.Fatalf("type = %#v", got)
+	}
+	if got := resp.Auth.Metadata["email"]; got != want["email"] {
+		t.Fatalf("email = %#v", got)
+	}
+	if got := resp.Auth.Metadata["oauth_provider"]; got != siteWorkBuddyAI {
+		t.Fatalf("oauth_provider = %#v", got)
+	}
+	for key := range credentialKeys {
+		if _, ok := resp.Auth.Metadata[key]; ok {
+			t.Fatalf("metadata[%q] echoed the credential; a stale copy would overwrite refreshed storage", key)
+		}
+	}
+	if string(resp.Auth.StorageJSON) != string(body) {
+		t.Fatal("storage did not round-trip the auth file")
 	}
 }
 

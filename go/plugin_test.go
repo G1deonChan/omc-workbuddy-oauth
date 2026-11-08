@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -234,6 +235,47 @@ func TestRefreshRotatesTokens(t *testing.T) {
 	}
 	if resp.NextRefreshAfter.IsZero() || resp.Auth.NextRefreshAfter.IsZero() {
 		t.Fatal("no next refresh was scheduled")
+	}
+}
+
+// A refresh replaces the auth record CPA persists, and its merge treats a field
+// the refresh omits as deleted. The host-managed metadata must therefore
+// survive a token rotation, or the note (and every other management field)
+// disappears from the credential.
+func TestRefreshPreservesManagementFields(t *testing.T) {
+	resetPluginState()
+	sender := &fakeSender{reply: func(pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error) {
+		return jsonReply(200, `{"code":0,"data":{"accessToken":"at-2","refreshToken":"rt-2","expiresIn":3600}}`), nil
+	}}
+	metadata := map[string]any{
+		"note":            "work account",
+		"prefix":          "w",
+		"priority":        7,
+		"weight":          3,
+		"proxy_url":       "http://proxy.test:8080",
+		"disable_cooling": true,
+		"websockets":      false,
+		"using_api":       true,
+		"expired":         "2030-01-01T00:00:00Z",
+		"request_retry":   2,
+		"headers":         map[string]any{"X-Test": "1"},
+		"excluded_models": []any{"m1"},
+		"model_aliases":   []any{map[string]any{"name": "m", "alias": "a"}},
+	}
+	resp, err := refreshCredential(pluginapi.AuthRefreshRequest{AuthID: "workbuddy-x.json", StorageJSON: testCredential(siteWorkBuddyAI), Metadata: metadata}, sender)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for key, want := range metadata {
+		if got := resp.Auth.Metadata[key]; !reflect.DeepEqual(got, want) {
+			t.Fatalf("metadata[%q] = %#v, want %#v", key, got, want)
+		}
+	}
+	if got := resp.Auth.Metadata["type"]; got != credentialProvider {
+		t.Fatalf("type = %#v", got)
+	}
+	if _, ok := resp.Auth.Metadata["access"]; ok {
+		t.Fatal("refresh echoed the credential into metadata")
 	}
 }
 
