@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -117,17 +119,17 @@ func execute(req pluginapi.ExecutorRequest, sender httpSender) (pluginapi.Execut
 		return pluginapi.ExecutorResponse{}, transportFailure(err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return pluginapi.ExecutorResponse{}, classifyUpstream(plan.Credential, resp.StatusCode, resp.Body)
+		return pluginapi.ExecutorResponse{}, classifyUpstream(plan.Credential, resp.StatusCode, resp.Headers, resp.Body)
 	}
 	if !bytes.Contains(resp.Body, []byte("data:")) {
 		// A 200 that is not an event stream is WorkBuddy refusing in JSON.
-		return pluginapi.ExecutorResponse{}, classifyUpstream(plan.Credential, http.StatusBadGateway, resp.Body)
+		return pluginapi.ExecutorResponse{}, classifyUpstream(plan.Credential, http.StatusBadGateway, resp.Headers, resp.Body)
 	}
 	payload, err := aggregateStream(resp.Body, plan.Model.Key)
 	if err != nil {
 		var refusal *streamRefusal
 		if errors.As(err, &refusal) {
-			return pluginapi.ExecutorResponse{}, classifyUpstream(plan.Credential, 0, refusal.Data)
+			return pluginapi.ExecutorResponse{}, classifyUpstream(plan.Credential, 0, nil, refusal.Data)
 		}
 		return pluginapi.ExecutorResponse{}, pluginabi.NewError("upstream_error", err.Error(), 502)
 	}
@@ -240,6 +242,9 @@ type streamPump struct {
 	target     string
 	buffer     sseBuffer
 	credential credential
+	// headers are the response headers the stream opened with. A refusal inside
+	// the stream has no headers of its own, so this is where its retry window is.
+	headers http.Header
 }
 
 // pumpStart is what the pump found before the client was answered: the stream's
@@ -277,7 +282,7 @@ func (p *streamPump) first(ready chan<- pumpStart) pumpStart {
 	}
 	for _, frame := range frames {
 		if err := refusalOf(frame.Data); err != nil {
-			start := pumpStart{err: classifyUpstream(p.credential, refusalStatus(err), frame.Data)}
+			start := pumpStart{err: classifyUpstream(p.credential, refusalStatus(err), p.headers, frame.Data)}
 			ready <- start
 			return start
 		}
@@ -352,13 +357,13 @@ func executeStream(req pluginapi.ExecutorRequest, callbackID, streamID string, s
 		if readErr != nil {
 			return nil, pluginabi.NewError("transport_error", "WorkBuddy upstream stream failed", 503)
 		}
-		return nil, classifyUpstream(plan.Credential, response.StatusCode, raw)
+		return nil, classifyUpstream(plan.Credential, response.StatusCode, response.Headers, raw)
 	}
 	// Answer the client as soon as the stream is open. Reading until the answer
 	// starts would keep the client waiting through a reasoning model's thinking,
 	// and a refusal WorkBuddy writes as the stream's first event is still caught
 	// inside firstFrameWindow.
-	pump := &streamPump{source: response.StreamID, target: streamID, credential: plan.Credential}
+	pump := &streamPump{source: response.StreamID, target: streamID, credential: plan.Credential, headers: response.Headers}
 	started := make(chan bool, 1)
 	ready := make(chan pumpStart, 1)
 	go func() {
@@ -451,10 +456,96 @@ func upstreamMessage(status int, body []byte) (code, message string) {
 	return "", text
 }
 
+// resetInstant is the moment a frequency limit says the allowance comes back.
+// WorkBuddy writes it as a wall clock carrying its own offset, in either
+// language: "your usage will reset at 2026-11-02 19:17:02 UTC+8" or
+// "2026-11-09 21:01:11 UTC+8 重置". A wall clock without an offset is not read at
+// all: the same digits mean sixteen different instants, and guessing one would
+// rest a model for hours the account never asked for.
+var resetInstant = regexp.MustCompile(`(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})\s*(?:UTC|GMT)\s*([+-])(\d{1,2})(?::?(\d{2}))?`)
+
+// maxResetHint bounds what a message can ask for. WorkBuddy's windows run to a
+// plan cycle, so a limit can legitimately sit weeks out; anything past a month
+// is a misread date, and resting a model that long on a misread costs requests.
+const maxResetHint = 31 * 24 * time.Hour
+
+// retryHint is how long a limit still runs, in whole seconds, or 0 when nothing
+// says. A Retry-After WorkBuddy sends is machine-stated and wins; otherwise the
+// instant its message names is read.
+func retryHint(headers http.Header, message string, now time.Time) int {
+	if headers != nil {
+		if value := strings.TrimSpace(headers.Get("Retry-After")); value != "" {
+			if seconds, err := strconv.Atoi(value); err == nil {
+				if seconds > 0 {
+					return seconds
+				}
+				return 0
+			}
+			if at, err := http.ParseTime(value); err == nil {
+				wait := at.Sub(now)
+				if wait <= 0 {
+					return 0
+				}
+				if seconds := int(wait / time.Second); seconds > 0 {
+					return seconds
+				}
+				return 1
+			}
+		}
+	}
+	return resetHint(message, now)
+}
+
+// resetHint is how long a limit's message says it lasts, in whole seconds, or 0
+// when the message names no instant still ahead of now.
+//
+// The number is not cosmetic: CPA reads pluginabi.Error.RetryAfterSeconds as the
+// cooldown it applies (for a 429, to this model), and without it CPA falls back
+// to its own quota backoff, which starts at one second and climbs. A limit that
+// names its reset would then be retried long before the account is ready, and
+// the console could only show CPA's guess instead of WorkBuddy's own deadline.
+func resetHint(message string, now time.Time) int {
+	m := resetInstant.FindStringSubmatch(message)
+	if m == nil {
+		return 0
+	}
+	hours, err := strconv.Atoi(m[8])
+	if err != nil {
+		return 0
+	}
+	minutes := 0
+	if m[9] != "" {
+		if minutes, err = strconv.Atoi(m[9]); err != nil {
+			return 0
+		}
+	}
+	offset := time.Duration(hours)*time.Hour + time.Duration(minutes)*time.Minute
+	if m[7] == "-" {
+		offset = -offset
+	}
+	// ParseInLocation rejects a wall clock no zone can hold (month 13, minute
+	// 61), which keeps a stray digit string from becoming a deadline.
+	zone := time.FixedZone("", int(offset/time.Second))
+	wall := m[1] + "-" + m[2] + "-" + m[3] + " " + m[4] + ":" + m[5] + ":" + m[6]
+	at, err := time.ParseInLocation("2006-01-02 15:04:05", wall, zone)
+	if err != nil {
+		return 0
+	}
+	wait := at.Sub(now)
+	if wait <= 0 || wait > maxResetHint {
+		return 0
+	}
+	if seconds := int(wait / time.Second); seconds > 0 {
+		return seconds
+	}
+	return 1
+}
+
 // classifyUpstream maps a WorkBuddy refusal onto the status the client should see.
 // A lapsed sign-in must read as one so CPA can ask for a new one; a frequency
-// limit keeps 429 and its message, which names when the allowance resets.
-func classifyUpstream(c credential, status int, body []byte) error {
+// limit keeps 429, its message, and the reset instant that message names, which
+// CPA turns into the cooldown rather than guessing one.
+func classifyUpstream(c credential, status int, headers http.Header, body []byte) error {
 	site, ok := siteFor(c.Site)
 	if !ok {
 		site = siteSpec{Name: "WorkBuddy"}
@@ -509,7 +600,9 @@ func classifyUpstream(c credential, status int, body []byte) error {
 	case effective == http.StatusForbidden:
 		return pluginabi.NewError("forbidden", site.Name+": "+message, effective)
 	case effective == http.StatusTooManyRequests:
-		return pluginabi.NewError("rate_limited", site.Name+" is limiting this account: "+message, effective)
+		err := pluginabi.NewError("rate_limited", site.Name+" is limiting this account: "+message, effective)
+		err.RetryAfterSeconds = retryHint(headers, message, time.Now())
+		return err
 	case effective >= 500:
 		return pluginabi.NewError("upstream_error", site.Name+" upstream failed: "+message, http.StatusBadGateway)
 	case effective == http.StatusNotFound:

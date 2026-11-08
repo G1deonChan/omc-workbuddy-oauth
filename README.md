@@ -107,7 +107,9 @@ not available: the plugin runs inside CPA on a server and reads no client files.
 - Import of existing `"type": "workbuddy"` auth files.
 - Error mapping that keeps a lapsed sign-in, an entitlement, a rate limit and an
   unapproved-channel refusal on their own status codes instead of folding them into
-  a generic upstream failure.
+  a generic upstream failure. A rate limit's message names when the allowance comes
+  back (`… 2026-11-02 19:17:02 UTC+8`), and that instant is handed to CPA as the
+  cooldown, so a limited model rests until WorkBuddy itself says it may run again.
 
 ## Installation
 
