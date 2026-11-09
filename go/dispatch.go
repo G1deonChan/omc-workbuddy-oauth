@@ -74,6 +74,7 @@ func registration() any {
 			Logo:             resourceAssetURL(pluginLogo),
 			ConfigFields: []pluginapi.ConfigField{
 				{Name: "site", Type: pluginapi.ConfigFieldTypeEnum, Default: siteWorkBuddy, EnumValues: []string{siteWorkBuddy, siteWorkBuddyAI}, Description: "Fallback sign-in build for a login request that names no entry: workbuddy (the default, the China build) or workbuddy-ai (the international build). The panel's WorkBuddy / WorkBuddy AI entries pick their own build and do not read this."},
+				{Name: "checkin_auto", Type: pluginapi.ConfigFieldTypeBoolean, Default: false, Description: "Automatically check in eligible China WorkBuddy accounts at startup, 09:00 and 21:00 Beijing time (default off). Does not claim international trial credits."},
 				{Name: "max_concurrency", Type: pluginapi.ConfigFieldTypeInteger, Default: 3, Description: "Maximum simultaneous requests per credential (default 3)."},
 				{Name: "app_version", Type: pluginapi.ConfigFieldTypeString, Default: defaultAppVersion, Description: "WorkBuddy desktop version the client claims in its User-Agent (default 5.9.3). WorkBuddy refuses a chat that does not name a WorkBuddy client."},
 				{Name: "cli_version", Type: pluginapi.ConfigFieldTypeString, Default: defaultCLIVersion, Description: "WorkBuddy CLI version the client claims in its User-Agent (default 2.165.0)."},
@@ -104,6 +105,9 @@ func handleMethod(method string, raw []byte) (any, error) {
 		}
 		if err := configure(r.ConfigYAML); err != nil {
 			return nil, pluginabi.NewError("invalid_config", err.Error(), 400)
+		}
+		if getConfig().CheckinAuto {
+			ensureCheckinScheduler()
 		}
 		return registration(), nil
 	case "plugin.quiesce", "plugin.shutdown":
