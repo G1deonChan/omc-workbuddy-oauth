@@ -125,6 +125,21 @@ plugins:
 | `max_concurrency` | integer | `3` | 每凭证 1–100 个并发请求 |
 | `app_version` | string | `5.9.3` | 客户端 `User-Agent` 声称的 WorkBuddy 桌面版本 |
 | `cli_version` | string | `2.165.0` | 客户端 `User-Agent` 声称的 WorkBuddy CLI 版本 |
+| `checkin_auto` | boolean | `false` | 显式开启国内版每日自动签到（北京时间 09:00 / 21:00，重启后补查） |
+
+自动签到复用 CPA 现有 OAuth 凭证和宿主 HTTP 桥接：先查当天状态，再领取积分，
+多账号逐个执行，同一天不重复领取。不自动使用 refresh token，也不支持国际版
+一次性试用积分领取。CPA 需要保持运行才能执行定时任务；读取配额也会尝试补签。
+
+示例：
+
+```yaml
+plugins:
+  configs:
+    omc-workbuddy-oauth:
+      enabled: true
+      checkin_auto: true
+```
 
 WorkBuddy 会拒绝 `User-Agent` 不以 `WorkBuddy/<version>` 开头的对话（错误 `10085`），
 因此两个版本号属于配置而不是常量：厂商升级构建不需要新版本发布。

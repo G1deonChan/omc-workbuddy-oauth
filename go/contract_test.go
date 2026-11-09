@@ -31,7 +31,7 @@ func TestRegistrationContract(t *testing.T) {
 	if meta.Logo != publicAssetBaseURL+pluginLogo {
 		t.Fatalf("logo = %q", meta.Logo)
 	}
-	if len(meta.ConfigFields) != 5 {
+	if len(meta.ConfigFields) != 6 {
 		t.Fatalf("config fields = %+v", meta.ConfigFields)
 	}
 	for _, field := range meta.ConfigFields {
@@ -39,11 +39,25 @@ func TestRegistrationContract(t *testing.T) {
 			t.Fatalf("field %q has no default or description", field.Name)
 		}
 	}
+	var checkin *pluginapi.ConfigField
+	var checkin *pluginapi.ConfigField
 	var exclude *pluginapi.ConfigField
 	for i := range meta.ConfigFields {
+		if meta.ConfigFields[i].Name == "checkin_auto" {
+			checkin = &meta.ConfigFields[i]
+		}
+		if meta.ConfigFields[i].Name == "checkin_auto" {
+			checkin = &meta.ConfigFields[i]
+		}
 		if meta.ConfigFields[i].Name == "exclude_models" {
 			exclude = &meta.ConfigFields[i]
 		}
+	}
+	if checkin == nil || checkin.Type != pluginapi.ConfigFieldTypeBoolean || checkin.Default != false {
+		t.Fatalf("checkin_auto field = %+v", checkin)
+	}
+	if checkin == nil || checkin.Type != pluginapi.ConfigFieldTypeBoolean || checkin.Default != false {
+		t.Fatalf("checkin_auto field = %+v", checkin)
 	}
 	if exclude == nil || exclude.Type != pluginapi.ConfigFieldTypeArray {
 		t.Fatalf("exclude_models field = %+v", exclude)
@@ -298,7 +312,9 @@ func TestConfigurationValidation(t *testing.T) {
 	valid := []string{
 		"",
 		"site: workbuddy-ai",
+		"checkin_auto: true",
 		"site: workbuddy\nmax_concurrency: 5",
+		"checkin_auto: true",
 		"app_version: 5.10.0\ncli_version: 2.200.0",
 	}
 	for _, raw := range valid {

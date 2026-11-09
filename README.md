@@ -142,6 +142,12 @@ Releases are created by GitHub Actions whenever a `v*` tag is pushed.
 | `max_concurrency` | integer | `3` | 1–100 requests per credential |
 | `app_version` | string | `5.9.3` | WorkBuddy desktop version the client claims in its `User-Agent` |
 | `cli_version` | string | `2.165.0` | WorkBuddy CLI version the client claims |
+| `checkin_auto` | boolean | `false` | Opt-in China-account automatic daily check-in (09:00 and 21:00 Beijing time plus startup catch-up) |
+
+Check-in uses the existing OAuth credentials and the host HTTP bridge. The plugin
+checks upstream status before claiming and never spends a rotating refresh token.
+International WorkBuddy AI accounts are excluded. The host needs to stay running
+for the scheduled slots; a quota read can also trigger a missed check-in.
 
 WorkBuddy refuses a chat whose `User-Agent` does not start `WorkBuddy/<version>`
 (error `10085`), so the two version fields are configuration rather than constants:
