@@ -118,6 +118,11 @@ func quotaFetch(req pluginapi.QuotaFetchRequest, sender httpSender) (pluginapi.Q
 	if !ok {
 		return out, pluginabiError("invalid_auth", "invalid WorkBuddy credential", 401)
 	}
+	// An on-demand fallback covers installations where the periodic host
+	// callbacks are not available, without changing the quota error contract.
+	if getConfig().CheckinAuto {
+		_, _ = autoCheckinAccount(sender, c, time.Now())
+	}
 	// The quota read never renews the credential. WorkBuddy rotates the refresh
 	// token on every use, and this call has no way to save the new one back, so a
 	// renewal here would spend a token the stored credential can no longer use.
