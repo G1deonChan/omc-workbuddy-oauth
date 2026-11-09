@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  Native WorkBuddy and WorkBuddy AI OAuth login for
+  Native WorkBuddy and WorkBuddy AI OAuth login adapted for Oh-My-CPA, compatible with
   <a href="https://github.com/router-for-me/CLIProxyAPI">CLIProxyAPI</a>
 </p>
 
