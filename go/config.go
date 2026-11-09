@@ -32,6 +32,8 @@ type config struct {
 	// of the list from the first request, so CPA never routes one to this
 	// credential.
 	ExcludeModels []string `yaml:"exclude_models"`
+	// CheckinAuto opts CN accounts into automatic daily credit claims.
+	CheckinAuto bool `yaml:"checkin_auto"`
 }
 
 var configMu sync.RWMutex
